@@ -1,0 +1,403 @@
+"""뉴스 수집 + 기관급 금융 감성 분석 모듈 (2단계).
+
+서로 협력하는 세 가지 구성요소를 제공한다.
+
+  * :class:`NewsCollector`   - CryptoPanic API(토큰이 설정된 경우) 또는 무료
+    공개 RSS 피드에서 암호화폐 뉴스를 비동기로 폴링하며, 이미 처리한 항목은
+    중복 제거한다.
+  * :class:`SentimentAnalyzer` - 기관급 금융 특화 감성 모델(기본
+    ``ProsusAI/finbert``)을 로드하여 영문 텍스트를 ``-1.0``(매우 부정)에서
+    ``+1.0``(매우 긍정)까지 연속 점수로 평가한다. 추론은 일반 CPU에 맞춰
+    최적화한다(스레드 튜닝 + INT8 동적 양자화 + ``inference_mode``).
+  * :class:`NewsAnalyzer`    - 1분 주기 폴링 루프를 오케스트레이션하여 새 뉴스를
+    수집·점수화하고, 결과 ``AnalyzedNews``를 콜백으로 전달한다.
+
+사용 예
+-------
+    import asyncio
+    from news_analyzer import NewsAnalyzer
+
+    async def on_news(item):
+        print(item.score, item.title)
+
+    async def main():
+        analyzer = NewsAnalyzer()
+        await analyzer.start(on_news)   # 영구 실행, 매분 폴링
+
+    asyncio.run(main())
+
+또는 단일 문장을 직접 점수화:
+
+    from news_analyzer import SentimentAnalyzer
+    sa = SentimentAnalyzer()
+    sa.load()
+    print(sa.score("Bitcoin ETF approved, market rallies"))  # ~ +0.9
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Awaitable, Callable, Iterable
+
+import aiohttp
+import feedparser
+
+from config import settings
+from logger import get_logger, log_exception
+
+log = get_logger(__name__)
+
+# CryptoPanic 토큰이 설정되지 않았을 때 사용하는 무료 공개 암호화폐 RSS 피드.
+DEFAULT_RSS_FEEDS: tuple[str, ...] = (
+    "https://cointelegraph.com/rss",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://decrypt.co/feed",
+    "https://bitcoinmagazine.com/feed",
+)
+
+CRYPTOPANIC_URL = "https://cryptopanic.com/api/v1/posts/"
+
+# 정중한 수집을 위한 HTTP 타임아웃/헤더.
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
+_HTTP_HEADERS = {"User-Agent": "NewsTradingBot/1.0 (+https://example.local)"}
+
+
+# --------------------------------------------------------------------------- #
+#  데이터 모델
+# --------------------------------------------------------------------------- #
+@dataclass(slots=True)
+class NewsItem:
+    """정규화된 단일 뉴스 헤드라인."""
+
+    id: str
+    title: str
+    url: str
+    source: str
+    published_at: datetime
+
+
+@dataclass(slots=True)
+class AnalyzedNews:
+    """[-1.0, 1.0] 감성 점수가 부여된 뉴스 항목."""
+
+    item: NewsItem
+    score: float
+    label: str
+    probabilities: dict[str, float] = field(default_factory=dict)
+
+    # 편의 위임 프로퍼티.
+    @property
+    def title(self) -> str:
+        return self.item.title
+
+    @property
+    def url(self) -> str:
+        return self.item.url
+
+
+# --------------------------------------------------------------------------- #
+#  뉴스 수집(비동기)
+# --------------------------------------------------------------------------- #
+class NewsCollector:
+    """암호화폐 뉴스 헤드라인을 비동기로 수집·중복 제거한다."""
+
+    def __init__(
+        self,
+        rss_feeds: Iterable[str] | None = None,
+        max_seen: int = 5000,
+    ) -> None:
+        self._token = settings.cryptopanic_token
+        self._rss_feeds = tuple(rss_feeds) if rss_feeds else DEFAULT_RSS_FEEDS
+        # 메모리 무한 증가를 막기 위한 한도 있는 LRU 형태의 seen 집합.
+        self._seen: "OrderedDict[str, None]" = OrderedDict()
+        self._max_seen = max_seen
+        self._source_mode = "cryptopanic" if self._token else "rss"
+        log.info("NewsCollector ready | mode=%s", self._source_mode)
+
+    # ---- 공개 API ----
+    async def fetch_new(self, session: aiohttp.ClientSession) -> list[NewsItem]:
+        """이전에 본 적 없는 뉴스 항목만 반환한다(중복 제거)."""
+        if self._token:
+            items = await self._fetch_cryptopanic(session)
+        else:
+            items = await self._fetch_rss(session)
+
+        fresh = [it for it in items if not self._is_seen(it.id)]
+        for it in fresh:
+            self._mark_seen(it.id)
+        if fresh:
+            log.info("Collected %d new headline(s) | mode=%s", len(fresh), self._source_mode)
+        return fresh
+
+    # ---- 중복 제거 ----
+    def _is_seen(self, item_id: str) -> bool:
+        return item_id in self._seen
+
+    def _mark_seen(self, item_id: str) -> None:
+        self._seen[item_id] = None
+        if len(self._seen) > self._max_seen:
+            self._seen.popitem(last=False)  # 가장 오래된 항목 제거
+
+    # ---- CryptoPanic 소스 ----
+    async def _fetch_cryptopanic(self, session: aiohttp.ClientSession) -> list[NewsItem]:
+        params = {"auth_token": self._token, "public": "true", "kind": "news"}
+        try:
+            async with session.get(
+                CRYPTOPANIC_URL, params=params, timeout=_HTTP_TIMEOUT
+            ) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+        except aiohttp.ClientError as exc:
+            log_exception(log, exc, context="news_fetch", source="cryptopanic")
+            return []
+        except Exception as exc:  # noqa: BLE001
+            log_exception(log, exc, context="news_fetch", source="cryptopanic")
+            return []
+
+        items: list[NewsItem] = []
+        for post in payload.get("results", []):
+            title = (post.get("title") or "").strip()
+            if not title:
+                continue
+            items.append(
+                NewsItem(
+                    id=str(post.get("id") or _hash(title)),
+                    title=title,
+                    url=post.get("url", ""),
+                    source=(post.get("source") or {}).get("title", "CryptoPanic"),
+                    published_at=_parse_dt(post.get("published_at")),
+                )
+            )
+        return items
+
+    # ---- RSS 소스 ----
+    async def _fetch_rss(self, session: aiohttp.ClientSession) -> list[NewsItem]:
+        tasks = [self._fetch_one_feed(session, url) for url in self._rss_feeds]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        items: list[NewsItem] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                log_exception(log, result, context="news_fetch", source="rss")
+                continue
+            items.extend(result)
+        return items
+
+    async def _fetch_one_feed(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> list[NewsItem]:
+        async with session.get(url, timeout=_HTTP_TIMEOUT) as resp:
+            resp.raise_for_status()
+            raw = await resp.read()
+        # feedparser는 블로킹/CPU 바운드이므로 이벤트 루프 밖에서 실행한다.
+        parsed = await asyncio.to_thread(feedparser.parse, raw)
+        source = parsed.feed.get("title", url) if parsed.feed else url
+
+        items: list[NewsItem] = []
+        for entry in parsed.entries:
+            title = (entry.get("title") or "").strip()
+            if not title:
+                continue
+            link = entry.get("link", "")
+            uid = entry.get("id") or link or _hash(title)
+            items.append(
+                NewsItem(
+                    id=str(uid),
+                    title=title,
+                    url=link,
+                    source=source,
+                    published_at=_entry_dt(entry),
+                )
+            )
+        return items
+
+
+# --------------------------------------------------------------------------- #
+#  감성 분석(FinBERT, CPU 최적화)
+# --------------------------------------------------------------------------- #
+class SentimentAnalyzer:
+    """[-1, 1] 점수를 반환하는 기관급 금융 특화 감성 모델.
+
+    로딩은 지연 처리된다(:meth:`load` 호출 또는 최초 :meth:`score` 시 자동 로드).
+    추론은 가장 가볍고 빠른 CPU 사용량을 위해 INT8 동적 양자화, 제한된 CPU
+    스레드, ``torch.inference_mode``로 수행한다.
+    """
+
+    def __init__(self, model_name: str | None = None) -> None:
+        self._model_name = model_name or settings.finbert_model
+        self._tokenizer = None
+        self._model = None
+        self._torch = None
+        self._id2label: dict[int, str] = {}
+        self._loaded = False
+
+    def load(self) -> None:
+        """모델을 다운로드(캐시됨)하고 CPU 추론용으로 준비한다."""
+        if self._loaded:
+            return
+
+        # 앱 나머지 부분이 torch 로딩 없이 시작될 수 있도록 지연 임포트한다.
+        import torch
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+        )
+
+        # ---- CPU 스레드 튜닝 ----
+        threads = settings.torch_num_threads
+        if threads and threads > 0:
+            torch.set_num_threads(threads)
+        log.info(
+            "Loading sentiment model '%s' | torch_threads=%d",
+            self._model_name,
+            torch.get_num_threads(),
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(self._model_name)
+        model = AutoModelForSequenceClassification.from_pretrained(self._model_name)
+        model.eval()
+
+        # ---- INT8 동적 양자화: CPU에서 가장 가볍고 빠름 ----
+        try:
+            model = torch.quantization.quantize_dynamic(
+                model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+            log.info("Applied INT8 dynamic quantization to Linear layers")
+        except Exception as exc:  # noqa: BLE001 - 양자화는 최선 노력(best-effort)
+            log_exception(log, exc, context="model_quantize")
+
+        self._torch = torch
+        self._tokenizer = tokenizer
+        self._model = model
+        self._id2label = {
+            int(k): str(v).lower() for k, v in model.config.id2label.items()
+        }
+        self._loaded = True
+        log.info("Sentiment model ready | labels=%s", list(self._id2label.values()))
+
+    def score(self, text: str) -> float:
+        """단일 문장에 대한 [-1.0, 1.0] 감성 점수를 반환한다."""
+        return self.analyze(text)[0]
+
+    def analyze(self, text: str) -> tuple[float, str, dict[str, float]]:
+        """``text``에 대해 ``(점수, 라벨, 확률분포)``를 반환한다.
+
+        ``점수 = P(positive) - P(negative)`` ∈ [-1, 1]이며, ``라벨``은 가장 높은
+        확률을 가진 클래스다.
+        """
+        if not self._loaded:
+            self.load()
+        assert self._torch is not None and self._model is not None
+
+        text = (text or "").strip()
+        if not text:
+            return 0.0, "neutral", {}
+
+        torch = self._torch
+        inputs = self._tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            padding=True,
+        )
+        with torch.inference_mode():
+            logits = self._model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1)[0]
+
+        prob_map = {
+            self._id2label[i]: float(probs[i]) for i in range(len(probs))
+        }
+        pos = prob_map.get("positive", 0.0)
+        neg = prob_map.get("negative", 0.0)
+        score = round(pos - neg, 4)
+        label = max(prob_map, key=prob_map.get)
+        return score, label, {k: round(v, 4) for k, v in prob_map.items()}
+
+
+# --------------------------------------------------------------------------- #
+#  오케스트레이션: 매분 폴링, 수집 + 분석
+# --------------------------------------------------------------------------- #
+NewsCallback = Callable[[AnalyzedNews], Awaitable[None]]
+
+
+class NewsAnalyzer:
+    """``NEWS_POLL_INTERVAL``초마다 뉴스를 폴링하고 헤드라인을 점수화한다."""
+
+    def __init__(self) -> None:
+        self.collector = NewsCollector()
+        self.sentiment = SentimentAnalyzer()
+        self._interval = settings.news_poll_interval
+        self._running = False
+
+    async def start(self, callback: NewsCallback) -> None:
+        """폴링 루프를 영구 실행하며, 분석된 항목마다 ``callback``을 호출한다."""
+        # 첫 폴링이 빠르도록 루프 시작 전에 모델을 한 번 워밍업한다.
+        await asyncio.to_thread(self.sentiment.load)
+        self._running = True
+        log.info("NewsAnalyzer loop started | interval=%ds", self._interval)
+
+        async with aiohttp.ClientSession(headers=_HTTP_HEADERS) as session:
+            while self._running:
+                started = asyncio.get_event_loop().time()
+                try:
+                    await self._poll_once(session, callback)
+                except Exception as exc:  # noqa: BLE001 - 루프는 살아남아야 한다
+                    log_exception(log, exc, context="news_loop")
+
+                # 작업 소요 시간을 차감하고 남은 주기만큼 대기한다.
+                elapsed = asyncio.get_event_loop().time() - started
+                await asyncio.sleep(max(1.0, self._interval - elapsed))
+
+    def stop(self) -> None:
+        self._running = False
+
+    async def poll_once(self, callback: NewsCallback) -> list[AnalyzedNews]:
+        """수집+분석 사이클을 1회 실행한다(테스트/수동 실행에 유용)."""
+        if not self.sentiment._loaded:
+            await asyncio.to_thread(self.sentiment.load)
+        async with aiohttp.ClientSession(headers=_HTTP_HEADERS) as session:
+            return await self._poll_once(session, callback)
+
+    async def _poll_once(
+        self, session: aiohttp.ClientSession, callback: NewsCallback
+    ) -> list[AnalyzedNews]:
+        items = await self.collector.fetch_new(session)
+        analyzed: list[AnalyzedNews] = []
+        for item in items:
+            score, label, probs = await asyncio.to_thread(
+                self.sentiment.analyze, item.title
+            )
+            result = AnalyzedNews(item=item, score=score, label=label, probabilities=probs)
+            analyzed.append(result)
+            try:
+                await callback(result)
+            except Exception as exc:  # noqa: BLE001 - 콜백이 루프를 죽이면 안 됨
+                log_exception(log, exc, context="news_callback", title=item.title)
+        return analyzed
+
+
+# --------------------------------------------------------------------------- #
+#  헬퍼
+# --------------------------------------------------------------------------- #
+def _hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _parse_dt(value: str | None) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+
+def _entry_dt(entry) -> datetime:
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if parsed:
+        return datetime(*parsed[:6], tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)

@@ -1,0 +1,26 @@
+# Core trading & exchange connectivity
+ccxt>=4.4.0
+
+# Telegram async notifications
+python-telegram-bot>=21.0
+
+# Configuration & secrets management (12-factor / production standard)
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
+
+# News ingestion & financial NLP sentiment (Stage 2)
+aiohttp>=3.10          # async HTTP for CryptoPanic API / RSS fetching
+feedparser>=6.0        # parse public crypto RSS feeds
+transformers>=4.40     # load FinBERT / finance-tuned RoBERTa
+torch>=2.2             # CPU inference backend (install the +cpu build)
+huggingface-hub>=0.23  # model download / caching
+
+# Technical indicators & trading engine (Stage 3)
+pandas>=2.2            # OHLCV dataframes
+numpy>=1.26            # linear-regression slope, numeric ops
+pandas_ta>=0.3.14      # RSI / ATR and other technical indicators
+
+# Web GUI dashboard (Stage 4)
+streamlit>=1.30        # remote-deployable web dashboard
+plotly>=5.20           # interactive candlestick charts with TP/SL lines
