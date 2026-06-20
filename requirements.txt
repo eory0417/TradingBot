@@ -24,3 +24,4 @@ pandas_ta>=0.3.14      # RSI / ATR and other technical indicators
 # Web GUI dashboard (Stage 4)
 streamlit>=1.30        # remote-deployable web dashboard
 plotly>=5.20           # interactive candlestick charts with TP/SL lines
+deep-translator>=1.11  # news headline EN→KO for dashboard & logs

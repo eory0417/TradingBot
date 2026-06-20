@@ -222,15 +222,18 @@ class TradingEngine:
         return indicators
 
     # ---- 계정/시세 조회 ----
-    async def fetch_balance_usdt(self) -> float:
-        """USDⓈ-M 선물 지갑의 USDT 가용 잔고를 조회한다."""
+    async def fetch_balance_usdt(self) -> tuple[float, str | None]:
+        """USDⓈ-M 선물 지갑의 USDT 가용 잔고를 조회한다.
+
+        반환값: (잔고, 오류 메시지). 오류 시 잔고는 0.0이고 두 번째 값에 사유가 담긴다.
+        """
         try:
             balance = await self.exchange.fetch_balance()
             usdt = balance.get("USDT", {})
-            return float(usdt.get("free") or usdt.get("total") or 0.0)
+            return float(usdt.get("free") or usdt.get("total") or 0.0), None
         except Exception as exc:  # noqa: BLE001
             log_exception(log, exc, context="fetch_balance")
-            return 0.0
+            return 0.0, f"{type(exc).__name__}: {exc}"
 
     async def fetch_mark_price(self, symbol: str) -> float | None:
         """심볼의 현재 마크/체결 가격을 조회한다."""

@@ -59,18 +59,20 @@ def _configure_root() -> None:
     root = logging.getLogger()
     root.setLevel(level)
 
-    # Windows 콘솔(cp949 등)에서 유니코드(이모지/CJK/대시) 로그가 인코딩 에러를
-    # 일으키지 않도록 stdout을 UTF-8(미지원 문자는 치환)로 재설정한다.
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
-    except (AttributeError, ValueError):
-        pass
-
-    # ---- 콘솔 핸들러(stdout) ----
-    console = logging.StreamHandler(stream=sys.stdout)
-    console.setLevel(level)
-    console.setFormatter(formatter)
-    root.addHandler(console)
+    # Streamlit은 stdout을 래핑하므로 Windows에서 reconfigure 시 OSError가 난다.
+    # Streamlit 실행 시에는 파일 로그만 사용하고, 터미널 직접 실행 시에만 콘솔 출력.
+    in_streamlit = "streamlit" in sys.modules
+    if not in_streamlit:
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                if sys.stdout.isatty():
+                    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+            except Exception:
+                pass
+        console = logging.StreamHandler(stream=sys.stdout)
+        console.setLevel(level)
+        console.setFormatter(formatter)
+        root.addHandler(console)
 
     # ---- 롤링 파일 핸들러 ----
     log_dir = settings.log_path

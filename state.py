@@ -55,6 +55,7 @@ class NewsView:
     score: float
     label: str
     source: str
+    title_ko: str = ""
 
 
 class BotState:

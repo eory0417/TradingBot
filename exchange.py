@@ -57,9 +57,10 @@ def create_exchange() -> ccxt.binance:
     )
 
     if settings.binance_testnet:
-        # 모든 REST/WS 호출을 바이낸스 선물 테스트넷 엔드포인트로 라우팅한다.
-        exchange.set_sandbox_mode(True)
-        log.info("Binance client initialized in TESTNET (sandbox) mode")
+        # 구 선물 테스트넷(sandbox)은 폐지됨 → Binance Demo Trading API 사용.
+        # demo.binance.com 에서 발급한 API 키가 필요하다(실거래 키와 호환되지 않음).
+        exchange.enable_demo_trading(True)
+        log.info("Binance client initialized in DEMO trading mode")
     else:
         log.warning("Binance client initialized in LIVE (real funds) mode")
 

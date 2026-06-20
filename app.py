@@ -1,23 +1,12 @@
 """Streamlit 웹 GUI 대시보드 (4단계).
 
-원격 서버 배포에 유리한 단일 프로세스 구성으로, 트레이딩 봇(:mod:`bot`)을
-백그라운드 스레드에서 실행하고 공유 상태(:mod:`state`)를 실시간으로 시각화한다.
-
-화면 구성
----------
-  * 상단    : 계정 잔고(USDT), 실행 상태, 오픈 포지션 현황.
-  * 사이드바 : 설정 입력 패널(증거금 모드/레버리지/투자금/손절% 등) + 시작/정지.
-  * 중앙    : 진입 코인의 가격 흐름 + 동적 익절/손절 라인 캔들 차트 2개.
-  * 하단    : 실시간 뉴스/감성 점수, 진입·청산 로그, 주문 실패 사유 스크롤 출력.
-
-실행:  streamlit run app.py
+실행:  python -m streamlit run app.py
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
-from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -25,18 +14,51 @@ import streamlit as st
 
 import bot as botmod
 from config import settings
-from state import STATE
 
-st.set_page_config(page_title="뉴스 트레이딩 봇", layout="wide", page_icon="📊")
+st.set_page_config(
+    page_title="뉴스 트레이딩 봇",
+    layout="wide",
+    page_icon="📊",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+<style>
+    .block-container { padding-top: 0.6rem; padding-bottom: 0.4rem; max-width: 100%; }
+    h1 { font-size: 1.25rem !important; line-height: 1.2 !important;
+         margin: 0 0 0.35rem 0 !important; padding: 0 !important; }
+    h2, h3, [data-testid="stHeader"] { font-size: 0.92rem !important;
+         margin: 0.25rem 0 0.15rem 0 !important; padding: 0 !important; }
+    [data-testid="stMetric"] {
+        background: rgba(240,242,246,0.45); border-radius: 6px;
+        padding: 0.2rem 0.45rem !important;
+    }
+    [data-testid="stMetricValue"] { font-size: 1rem !important; }
+    [data-testid="stMetricLabel"] { font-size: 0.72rem !important; }
+    [data-testid="stAlert"], .stAlert {
+        padding: 0.35rem 0.55rem !important; margin: 0.15rem 0 !important;
+        font-size: 0.82rem !important;
+    }
+    [data-testid="stCaptionContainer"] p, .stCaption {
+        font-size: 0.75rem !important; margin-bottom: 0.1rem !important;
+    }
+    .news-item { font-size: 0.78rem; line-height: 1.35; margin-bottom: 0.35rem; }
+    .news-ko { color: #444; font-size: 0.76rem; }
+    .log-item { font-size: 0.76rem; line-height: 1.3; margin-bottom: 0.25rem; }
+    div[data-testid="column"] { padding: 0 0.25rem !important; }
+    hr { margin: 0.35rem 0 !important; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 
-# --------------------------------------------------------------------------- #
-#  백그라운드 봇 러너(프로세스 전역 싱글톤)
-# --------------------------------------------------------------------------- #
 class BotRunner:
-    """봇을 자체 이벤트 루프를 가진 데몬 스레드에서 구동한다."""
+    """봇 스레드 + UI가 공유하는 단일 BotState를 묶는다."""
 
-    def __init__(self) -> None:
+    def __init__(self, state) -> None:
+        self.state = state
         self.thread: threading.Thread | None = None
         self.bot: botmod.TradingBot | None = None
 
@@ -46,12 +68,18 @@ class BotRunner:
     def start(self) -> None:
         if self.is_alive():
             return
-        self.bot = botmod.TradingBot()
+        self.bot = botmod.TradingBot(state=self.state)
 
         def _run() -> None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.bot.run())
+            try:
+                loop.run_until_complete(self.bot.run())
+            except Exception as exc:  # noqa: BLE001
+                self.state.log("ERROR", "system", f"봇 스레드 오류: {exc}")
+                self.state.set_running(False, status="error")
+            finally:
+                loop.close()
 
         self.thread = threading.Thread(target=_run, daemon=True, name="trading-bot")
         self.thread.start()
@@ -59,19 +87,19 @@ class BotRunner:
     def stop(self) -> None:
         if self.bot is not None:
             self.bot.stop()
+        self.state.set_running(False, status="stopped")
 
 
 @st.cache_resource
 def get_runner() -> BotRunner:
-    return BotRunner()
+    from state import BotState
+    return BotRunner(BotState())
 
 
 runner = get_runner()
+STATE = runner.state
 
 
-# --------------------------------------------------------------------------- #
-#  사이드바: 설정 입력 패널 + 제어
-# --------------------------------------------------------------------------- #
 def render_sidebar() -> None:
     st.sidebar.header("⚙️ 설정")
 
@@ -79,21 +107,20 @@ def render_sidebar() -> None:
         "증거금 모드", ["isolated", "cross"],
         index=0 if settings.margin_mode == "isolated" else 1,
     )
-    leverage = st.sidebar.slider("레버리지 배수", 1, 25, settings.leverage)
+    leverage = st.sidebar.slider("레버리지", 1, 25, settings.leverage)
     notional = st.sidebar.number_input(
-        "투자금 / 진입 (USDT)", min_value=5.0, value=float(settings.position_size_usdt), step=5.0
+        "진입금 (USDT)", min_value=5.0, value=float(settings.position_size_usdt), step=5.0
     )
     stop_loss = st.sidebar.number_input(
-        "고정 손절 (%)", min_value=0.1, value=float(settings.stop_loss_pct), step=0.1
+        "손절 (%)", min_value=0.1, value=float(settings.stop_loss_pct), step=0.1
     )
     atr_mult = st.sidebar.number_input(
-        "Trailing ATR 배수(기본)", min_value=0.5, value=float(settings.trailing_atr_mult), step=0.5
+        "Trailing ATR", min_value=0.5, value=float(settings.trailing_atr_mult), step=0.5
     )
     time_exit = st.sidebar.number_input(
-        "시간 청산 (시간)", min_value=0.5, value=float(settings.time_exit_hours), step=0.5
+        "시간청산 (h)", min_value=0.5, value=float(settings.time_exit_hours), step=0.5
     )
 
-    # 설정을 즉시 반영(다음 진입부터 적용).
     settings.margin_mode = margin_mode
     settings.leverage = int(leverage)
     settings.position_size_usdt = float(notional)
@@ -108,20 +135,35 @@ def render_sidebar() -> None:
 
     st.sidebar.divider()
     col1, col2 = st.sidebar.columns(2)
-    if col1.button("▶ 시작", use_container_width=True, type="primary"):
+    running = runner.is_alive() or STATE.running
+    if col1.button(
+        "▶ 시작", use_container_width=True, type="primary", disabled=running,
+    ):
+        mode = botmod.exchange_mode_label()
+        STATE.set_running(True, status=f"시작 중 ({mode})")
+        STATE.log("INFO", "system", "▶ 시작 버튼 — 봇 초기화 중 (FinBERT·거래소 연결)")
         runner.start()
-        st.toast("봇을 시작했습니다.")
-    if col2.button("■ 정지", use_container_width=True):
+        st.rerun()
+    if col2.button("■ 정지", use_container_width=True, disabled=not running):
         runner.stop()
-        st.toast("봇 정지 요청을 보냈습니다.")
+        STATE.log("INFO", "system", "■ 정지 버튼 — 봇 종료 요청")
+        st.rerun()
 
-    mode = "SIM (페이퍼)" if not botmod.has_real_credentials() else "LIVE"
-    st.sidebar.caption(f"모드: **{mode}** · 상태: **{STATE.status}**")
+    mode = botmod.exchange_mode_label()
+    if runner.is_alive():
+        thread_label = "🟢 스레드 실행 중"
+    elif STATE.running:
+        thread_label = "🟡 시작 처리 중"
+    else:
+        thread_label = "⚪ 대기"
+    st.sidebar.caption(f"{thread_label} · 모드: **{mode}** · **{STATE.status}**")
+    if botmod.has_real_credentials() and settings.binance_testnet:
+        st.sidebar.caption("Demo: demo.binance.com 키 필요. 실거래는 BINANCE_TESTNET=false")
 
 
-# --------------------------------------------------------------------------- #
-#  차트
-# --------------------------------------------------------------------------- #
+_CHART_HEIGHT = 210
+
+
 def candlestick(symbol: str) -> go.Figure | None:
     ohlcv = STATE.get_ohlcv(symbol)
     if not ohlcv:
@@ -136,61 +178,68 @@ def candlestick(symbol: str) -> go.Figure | None:
         )]
     )
 
-    # 현재 포지션의 동적 익절/손절 라인 오버레이.
     pos = next((p for p in STATE.get_positions() if p.symbol == symbol), None)
     if pos is not None:
         fig.add_hline(
             y=pos.stop_loss, line_dash="dash", line_color="#d62728",
-            annotation_text=f"손절 {pos.stop_loss:.4f}", annotation_position="right",
+            annotation_text=f"SL {pos.stop_loss:.2f}", annotation_position="right",
         )
         fig.add_hline(
             y=pos.trailing_stop, line_dash="dot", line_color="#2ca02c",
-            annotation_text=f"익절(Trailing x{pos.atr_mult}) {pos.trailing_stop:.4f}",
-            annotation_position="right",
+            annotation_text=f"TP {pos.trailing_stop:.2f}", annotation_position="right",
         )
         fig.add_hline(
             y=pos.entry_price, line_dash="solid", line_color="#1f77b4",
-            annotation_text=f"진입 {pos.entry_price:.4f}", annotation_position="left",
+            annotation_text=f"Entry {pos.entry_price:.2f}", annotation_position="left",
         )
 
     fig.update_layout(
-        height=360, margin=dict(l=10, r=10, t=30, b=10),
-        xaxis_rangeslider_visible=False, title=symbol,
+        height=_CHART_HEIGHT,
+        margin=dict(l=4, r=4, t=22, b=4),
+        xaxis_rangeslider_visible=False,
+        title=dict(text=symbol, font=dict(size=11)),
+        font=dict(size=10),
     )
     return fig
 
 
-# --------------------------------------------------------------------------- #
-#  실시간 대시보드(프래그먼트: 일정 주기로 자동 갱신)
-# --------------------------------------------------------------------------- #
 @st.fragment(run_every=2)
 def render_dashboard() -> None:
-    # ---- 상단 지표 ----
+    # ---- 실행 상태 배너 (시작 버튼 피드백) ----
+    if runner.is_alive():
+        if STATE.status.startswith("running"):
+            st.success(f"🟢 **봇 실행 중** — {STATE.status}")
+        elif STATE.status.startswith("시작"):
+            st.warning(f"🟡 **봇 시작 중** — {STATE.status} · FinBERT/거래소 연결 중 (1~2분)")
+        else:
+            st.info(f"🔵 **봇 스레드 동작 중** — {STATE.status}")
+    elif STATE.running:
+        st.warning("🟡 **시작 요청됨** — 스레드 기동 대기 중…")
+    else:
+        st.info("⚪ **대기 중** — 사이드바 **▶ 시작** 버튼을 눌러 주세요.")
+
     positions = STATE.get_positions()
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("계정 잔고 (USDT)", f"{STATE.get_balance():,.2f}")
-    c2.metric("오픈 포지션", f"{len(positions)} / {settings.max_positions}")
+    c1.metric("잔고 (USDT)", f"{STATE.get_balance():,.2f}")
+    c2.metric("포지션", f"{len(positions)} / {settings.max_positions}")
     c3.metric("상태", STATE.status)
 
-    # ---- 오픈 포지션 현황 ----
-    st.subheader("📌 오픈 포지션")
+    st.markdown("##### 📌 오픈 포지션")
     if positions:
         df = pd.DataFrame([{
-            "코인": p.symbol, "방향": p.side.upper(), "수량": round(p.amount, 6),
-            "진입가": round(p.entry_price, 4), "현재가": round(p.mark_price, 4),
-            "손절가": round(p.stop_loss, 4), "익절(Trailing)": round(p.trailing_stop, 4),
-            "ATR배수": p.atr_mult, "미실현%": p.unrealized_pct,
-            "진입시각": p.opened_at,
+            "코인": p.symbol, "방향": p.side.upper(), "수량": round(p.amount, 4),
+            "진입": round(p.entry_price, 2), "현재": round(p.mark_price, 2),
+            "손절": round(p.stop_loss, 2), "익절": round(p.trailing_stop, 2),
+            "PnL%": p.unrealized_pct,
         } for p in positions])
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, use_container_width=True, hide_index=True, height=70)
     else:
-        st.info("현재 오픈된 포지션이 없습니다.")
+        st.caption("오픈 포지션 없음")
 
-    # ---- 캔들 차트 2개 ----
-    st.subheader("📈 가격 & 동적 익절/손절 라인")
+    st.markdown("##### 📈 차트 (15m)")
     open_syms = [p.symbol for p in positions]
     data_syms = STATE.symbols_with_data()
-    # 우선 오픈 포지션 코인, 부족하면 데이터 있는 코인으로 2개 채움.
     chart_syms = (open_syms + [s for s in data_syms if s not in open_syms])[:2]
     if chart_syms:
         cols = st.columns(len(chart_syms))
@@ -199,42 +248,44 @@ def render_dashboard() -> None:
             if fig is not None:
                 col.plotly_chart(fig, use_container_width=True, key=f"chart_{sym}")
     else:
-        st.info("차트 데이터를 수집 중입니다...")
+        st.caption("차트 데이터 수집 중…")
 
-    # ---- 하단: 뉴스 / 로그 ----
-    st.subheader("📰 실시간 뉴스 · 로그")
+    st.markdown("##### 📰 뉴스 · 로그")
     n_col, l_col = st.columns(2)
 
     with n_col:
-        st.caption("실시간 뉴스 & 감성 점수")
-        news = STATE.get_news(40)
-        with st.container(height=260):
+        st.caption("실시간 뉴스 (EN + 한글)")
+        news = STATE.get_news(30)
+        with st.container(height=175):
             if not news:
-                st.write("뉴스 수집 대기 중...")
+                st.caption("뉴스 수집 대기 중…")
             for nw in news:
                 icon = "🟢" if nw.score > 0.2 else "🔴" if nw.score < -0.2 else "⚪"
+                ko = nw.title_ko or nw.title
                 st.markdown(
-                    f"{icon} `{nw.time}` **[{nw.score:+.2f} {nw.label}]** "
-                    f"{nw.title}  \n<sub>{nw.source}</sub>",
+                    f'<div class="news-item">{icon} <code>{nw.time}</code> '
+                    f"<b>[{nw.score:+.2f} {nw.label}]</b><br>"
+                    f"🇺🇸 {nw.title}<br>"
+                    f'<span class="news-ko">🇰🇷 {ko}</span><br>'
+                    f"<sub>{nw.source}</sub></div>",
                     unsafe_allow_html=True,
                 )
 
     with l_col:
-        st.caption("진입/청산 로그 · 주문 실패 사유")
-        logs = STATE.get_logs(120)
-        with st.container(height=260):
+        st.caption("진입/청산 · 주문 실패")
+        logs = STATE.get_logs(80)
+        with st.container(height=175):
             if not logs:
-                st.write("로그 대기 중...")
+                st.caption("로그 대기 중…")
             for lg in logs:
                 color = {"ERROR": "🔴", "WARNING": "🟡"}.get(lg["level"], "🟢")
                 st.markdown(
-                    f"{color} `{lg['time']}` **[{lg['category']}]** {lg['message']}"
+                    f'<div class="log-item">{color} <code>{lg["time"][-8:]}</code> '
+                    f"<b>[{lg['category']}]</b> {lg['message']}</div>",
+                    unsafe_allow_html=True,
                 )
 
 
-# --------------------------------------------------------------------------- #
-#  메인
-# --------------------------------------------------------------------------- #
-st.title("📊 바이낸스 USDⓈ-M 뉴스 트레이딩 봇")
+st.markdown("# 📊 바이낸스 USDⓈ-M 뉴스 트레이딩 봇")
 render_sidebar()
 render_dashboard()

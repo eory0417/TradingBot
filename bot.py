@@ -34,6 +34,7 @@ from news_analyzer import AnalyzedNews, NewsAnalyzer
 from state import STATE, NewsView, PositionView
 from strategy import Position, Side
 from trading_engine import TradingEngine, compute_indicators_from_df
+from translator import translate_to_korean
 
 log = get_logger(__name__)
 
@@ -74,6 +75,15 @@ def has_real_credentials() -> bool:
     """자격증명이 실제처럼 보이는지(플레이스홀더가 아닌지) 판정."""
     key = settings.binance_api_key.get_secret_value()
     return bool(key) and "your_" not in key
+
+
+def exchange_mode_label() -> str:
+    """현재 거래소 연결 모드 라벨(SIM / DEMO / LIVE)."""
+    if not has_real_credentials():
+        return "SIM(페이퍼)"
+    if settings.binance_testnet:
+        return "DEMO"
+    return "LIVE"
 
 
 # --------------------------------------------------------------------------- #
@@ -148,14 +158,15 @@ class TradingBot:
     async def run(self) -> None:
         """봇을 시작하고 뉴스 태스크 + 모니터 루프를 병행 실행한다."""
         self._running = True
-        mode = "SIM(페이퍼)" if self.sim else "LIVE"
+        mode = exchange_mode_label()
         self.state.set_running(True, status=f"running ({mode})")
         self._emit_log("INFO", "system", f"트레이딩 봇 시작 | 모드={mode} | 심볼={self.symbols}")
         log.info("TradingBot starting | mode=%s | symbols=%s", mode, self.symbols)
 
-        await self._setup()
-
         try:
+            self._emit_log("INFO", "system", "초기화 중 — 거래소/잔고 연결…")
+            await self._setup()
+            self._emit_log("INFO", "system", "초기화 완료 — 뉴스·차트 수집 시작 (FinBERT 로딩 중일 수 있음)")
             news_task = asyncio.create_task(self.news.start(self._on_news))
             monitor_task = asyncio.create_task(self._monitor_loop())
             await asyncio.gather(news_task, monitor_task)
@@ -166,6 +177,8 @@ class TradingBot:
             self._emit_log("ERROR", "system", f"봇 루프 오류: {exc}")
         finally:
             await self._teardown()
+            self.state.set_running(False, status="stopped")
+            self._emit_log("INFO", "system", "봇 종료")
 
     def stop(self) -> None:
         self._running = False
@@ -185,8 +198,15 @@ class TradingBot:
         await load_markets_safe(self.exchange)
         self.notifier = TelegramNotifier()
         self.engine = TradingEngine(self.exchange, notifier=self.notifier)
-        bal = await self.engine.fetch_balance_usdt()
+        bal, bal_err = await self.engine.fetch_balance_usdt()
         self.state.set_balance(bal)
+        if bal_err:
+            self._emit_log("ERROR", "system", f"잔고 조회 실패: {bal_err}")
+        elif exchange_mode_label() == "DEMO" and bal == 0.0:
+            self._emit_log(
+                "WARNING", "system",
+                "Demo 잔고가 0입니다. demo.binance.com API 키인지 확인하세요.",
+            )
 
     async def _teardown(self) -> None:
         try:
@@ -198,8 +218,18 @@ class TradingBot:
         except Exception as exc:  # noqa: BLE001
             log_exception(log, exc, context="bot_teardown")
 
+    async def _news_context(self, news: str, score: float | None = None) -> str:
+        """로그용 뉴스 요약(영문 원문 + 한글 번역)."""
+        ko = await asyncio.to_thread(translate_to_korean, news)
+        en = news if len(news) <= 120 else news[:117] + "…"
+        ko_show = ko if len(ko) <= 120 else ko[:117] + "…"
+        if score is not None:
+            return f"뉴스({score:+.2f}) | EN: {en} | 한글: {ko_show}"
+        return f"EN: {en} | 한글: {ko_show}"
+
     # ---- 뉴스 콜백(진입 트리거) ----
     async def _on_news(self, item: AnalyzedNews) -> None:
+        title_ko = await asyncio.to_thread(translate_to_korean, item.title)
         self.state.add_news(
             NewsView(
                 time=_now().strftime("%H:%M:%S"),
@@ -207,6 +237,7 @@ class TradingBot:
                 score=item.score,
                 label=item.label,
                 source=item.item.source,
+                title_ko=title_ko,
             )
         )
         symbols = detect_symbols(item.title, self.symbols)
@@ -241,9 +272,10 @@ class TradingBot:
         elif score < 0 and ind.slope < 0:
             side = "short"
         if side is None:
+            ctx = await self._news_context(news, score)
             self._emit_log(
                 "INFO", "entry",
-                f"진입 스킵 {symbol}: 뉴스({score:+.2f})와 기울기({ind.slope:+.4f}) 방향 불일치",
+                f"진입 스킵 {symbol}: {ctx} · 기울기({ind.slope:+.4f}) 방향 불일치",
             )
             return
 
@@ -262,7 +294,11 @@ class TradingBot:
         else:
             result = await self.engine.enter_position(symbol, side)
             if not result.is_filled:
-                self._emit_log("ERROR", "order", f"진입 실패 {symbol} {side}: {result.reason}")
+                ctx = await self._news_context(news, score)
+                self._emit_log(
+                    "ERROR", "order",
+                    f"진입 실패 {symbol} {side}: {result.reason} | {ctx}",
+                )
                 return
             order_price = result.price
             filled = result.filled_amount
@@ -276,10 +312,11 @@ class TradingBot:
             pos.prev_rsi = ind.rsi
             self.positions[symbol] = pos
 
+        ctx = await self._news_context(news, score)
         self._emit_log(
             "INFO", "entry",
             f"진입 {side.upper()} {symbol} | 진입가={order_price:.4f} 수량={filled:.6f} "
-            f"금액={self.notional:.2f}USDT 뉴스점수={score:+.2f}",
+            f"금액={self.notional:.2f}USDT | {ctx}",
         )
         self._sync_position_view(self.positions[symbol])
 
@@ -330,7 +367,10 @@ class TradingBot:
 
         # 잔고 갱신(LIVE).
         if not self.sim and self.engine is not None:
-            self.state.set_balance(await self.engine.fetch_balance_usdt())
+            bal, bal_err = await self.engine.fetch_balance_usdt()
+            self.state.set_balance(bal)
+            if bal_err:
+                self._emit_log("ERROR", "system", f"잔고 조회 실패: {bal_err}")
 
     # ---- 청산 ----
     async def _close(self, pos: Position, signal) -> None:
@@ -352,11 +392,12 @@ class TradingBot:
             self.positions.pop(pos.symbol, None)
         self.state.remove_position(pos.symbol)
 
+        ctx = await self._news_context(pos.entry_news, pos.entry_score)
         self._emit_log(
             "INFO", "exit",
             f"청산 {pos.side.upper()} {pos.symbol} | 진입가={pos.entry_price:.4f} "
             f"청산가={exit_price:.4f} 손익={pnl_pct:+.2f}% 사유={signal.exit_type} "
-            f"({signal.reason})",
+            f"({signal.reason}) | {ctx}",
         )
 
         if self.notifier is not None:
