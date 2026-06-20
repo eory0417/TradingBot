@@ -23,6 +23,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from kst_util import format_kst
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -44,6 +46,12 @@ class PositionView:
     entry_news: str
     entry_score: float
     opened_at: str
+    leverage: int = 1
+    opened_at_ms: int = 0   # 진입 시각(epoch ms) — 차트 진입 표시용
+    news_triggered_at_ms: int = 0  # 뉴스 인식(진입 트리거) 시각(epoch ms)
+    added: bool = False     # 추가 진입(피라미딩) 1회 수행 여부
+    notional: float = 0.0   # 총 명목금액(USDT, 추가 진입 포함)
+    trailing_active: bool = False  # 이익 구간 진입 후 Trailing 활성
 
 
 @dataclass
@@ -56,6 +64,8 @@ class NewsView:
     label: str
     source: str
     title_ko: str = ""
+    at_ms: int = 0          # 봇이 뉴스를 수신·처리한 시각(epoch ms)
+    published_at_ms: int = 0  # RSS 발행 시각(epoch ms) — GUI 표시용
 
 
 class BotState:
@@ -70,9 +80,15 @@ class BotState:
         self._lines: dict[str, deque] = {}
         self._news: deque[NewsView] = deque(maxlen=200)
         self._logs: deque[dict] = deque(maxlen=500)
+        # 수동 청산 요청 큐(GUI → 봇 모니터 루프). 심볼 집합.
+        self._close_requests: set[str] = set()
+        # 청산 완료된 거래 기록(수익률 통계용).
+        self._closed_trades: list[dict] = []
         self._settings: dict[str, Any] = {}
         self._running: bool = False
         self._status: str = "stopped"
+        # 프로그램(세션) 시작 시각 — 통계 기본 시작점.
+        self._session_start: datetime = _now()
         self._last_update: str = _now().isoformat()
 
     # ---- 잔고 ----
@@ -96,9 +112,45 @@ class BotState:
             self._positions.pop(symbol, None)
             self._touch()
 
+    def clear_positions(self) -> None:
+        """모든 포지션 스냅샷을 비운다(클린 스타트용)."""
+        with self._lock:
+            self._positions.clear()
+            self._touch()
+
     def get_positions(self) -> list[PositionView]:
         with self._lock:
             return list(self._positions.values())
+
+    # ---- 수동 청산 요청 ----
+    def request_close(self, symbol: str) -> None:
+        """GUI에서 특정 코인의 청산을 요청한다(봇이 다음 점검 주기에 처리)."""
+        with self._lock:
+            self._close_requests.add(symbol)
+            self._touch()
+
+    def pop_close_requests(self) -> list[str]:
+        """누적된 청산 요청을 모두 꺼내 비운다(봇 모니터 루프에서 호출)."""
+        with self._lock:
+            reqs = list(self._close_requests)
+            self._close_requests.clear()
+            return reqs
+
+    # ---- 청산 거래 기록(통계) ----
+    def record_trade(self, trade: dict) -> None:
+        """청산 완료된 거래 한 건을 기록한다."""
+        with self._lock:
+            self._closed_trades.append(trade)
+            self._touch()
+
+    def get_trades(self) -> list[dict]:
+        with self._lock:
+            return list(self._closed_trades)
+
+    @property
+    def session_start(self) -> datetime:
+        with self._lock:
+            return self._session_start
 
     # ---- OHLCV / 라인 ----
     def set_ohlcv(self, symbol: str, ohlcv: list[list[float]]) -> None:
@@ -133,12 +185,20 @@ class BotState:
         with self._lock:
             return list(self._news)[:limit]
 
+    def clear_news(self) -> None:
+        """뉴스 피드 표시를 비운다(봇 재시작 시 이전 세션 잔여 제거)."""
+        with self._lock:
+            self._news.clear()
+            self._touch()
+
     # ---- 로그 ----
     def log(self, level: str, category: str, message: str) -> None:
         with self._lock:
+            now = _now()
             self._logs.appendleft(
                 {
-                    "time": _now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "time": format_kst(now),
+                    "time_ms": int(now.timestamp() * 1000),
                     "level": level,
                     "category": category,
                     "message": message,

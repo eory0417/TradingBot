@@ -11,6 +11,9 @@
     최적화한다(스레드 튜닝 + INT8 동적 양자화 + ``inference_mode``).
   * :class:`NewsAnalyzer`    - 1분 주기 폴링 루프를 오케스트레이션하여 새 뉴스를
     수집·점수화하고, 결과 ``AnalyzedNews``를 콜백으로 전달한다.
+    **시작 직후 첫 폴링은 워밍업**으로 피드에 이미 있는 기사를 ``seen`` 에만
+    등록하고 콜백을 호출하지 않는다. :mod:`bot` 은 추가로 시작 후
+    ``NEWS_ENTRY_GRACE_SEC``(기본 60초) 동안도 진입을 막는다.
 
 사용 예
 -------
@@ -121,17 +124,25 @@ class NewsCollector:
     # ---- 공개 API ----
     async def fetch_new(self, session: aiohttp.ClientSession) -> list[NewsItem]:
         """이전에 본 적 없는 뉴스 항목만 반환한다(중복 제거)."""
-        if self._token:
-            items = await self._fetch_cryptopanic(session)
-        else:
-            items = await self._fetch_rss(session)
-
+        items = await self.fetch_all(session)
         fresh = [it for it in items if not self._is_seen(it.id)]
         for it in fresh:
             self._mark_seen(it.id)
         if fresh:
             log.info("Collected %d new headline(s) | mode=%s", len(fresh), self._source_mode)
         return fresh
+
+    async def fetch_all(self, session: aiohttp.ClientSession) -> list[NewsItem]:
+        """피드의 모든 헤드라인을 반환한다(중복 제거·seen 갱신 없음)."""
+        if self._token:
+            return await self._fetch_cryptopanic(session)
+        return await self._fetch_rss(session)
+
+    def seed_seen(self, items: list[NewsItem]) -> int:
+        """워밍업: 목록의 모든 ID 를 seen 에 등록한다."""
+        for it in items:
+            self._mark_seen(it.id)
+        return len(items)
 
     # ---- 중복 제거 ----
     def _is_seen(self, item_id: str) -> bool:
@@ -234,6 +245,23 @@ class SentimentAnalyzer:
         self._id2label: dict[int, str] = {}
         self._loaded = False
 
+    def _resolve_source(self) -> str:
+        """추론에 사용할 모델 경로: 파인튜닝 모델이 있으면 우선, 없으면 원본."""
+        try:
+            finetuned = settings.finetune_path
+            if (finetuned / "config.json").exists():
+                return str(finetuned)
+        except Exception:  # noqa: BLE001
+            pass
+        return self._model_name
+
+    def reload(self) -> None:
+        """현재 모델을 내리고 (파인튜닝본 우선) 다시 로드한다."""
+        self._loaded = False
+        self._model = None
+        self._tokenizer = None
+        self.load()
+
     def load(self) -> None:
         """모델을 다운로드(캐시됨)하고 CPU 추론용으로 준비한다."""
         if self._loaded:
@@ -250,14 +278,18 @@ class SentimentAnalyzer:
         threads = settings.torch_num_threads
         if threads and threads > 0:
             torch.set_num_threads(threads)
+
+        source = self._resolve_source()
+        if source != self._model_name:
+            log.info("Using fine-tuned sentiment model | path=%s", source)
         log.info(
             "Loading sentiment model '%s' | torch_threads=%d",
-            self._model_name,
+            source,
             torch.get_num_threads(),
         )
 
-        tokenizer = AutoTokenizer.from_pretrained(self._model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(self._model_name)
+        tokenizer = AutoTokenizer.from_pretrained(source)
+        model = AutoModelForSequenceClassification.from_pretrained(source)
         model.eval()
 
         # ---- INT8 동적 양자화: CPU에서 가장 가볍고 빠름 ----
@@ -332,6 +364,8 @@ class NewsAnalyzer:
         self.sentiment = SentimentAnalyzer()
         self._interval = settings.news_poll_interval
         self._running = False
+        # 시작 직후 첫 폴링: 피드에 남은 기존 기사는 seen 만 등록, 진입/콜백 생략.
+        self._warmup_pending = True
 
     async def start(self, callback: NewsCallback) -> None:
         """폴링 루프를 영구 실행하며, 분석된 항목마다 ``callback``을 호출한다."""
@@ -365,7 +399,22 @@ class NewsAnalyzer:
     async def _poll_once(
         self, session: aiohttp.ClientSession, callback: NewsCallback
     ) -> list[AnalyzedNews]:
+        # ---- 시작 워밍업: 피드에 이미 있던 기사는 seen 만 등록, 콜백·진입 없음 ----
+        if self._warmup_pending:
+            all_items = await self.collector.fetch_all(session)
+            if not all_items:
+                log.warning("News warmup: feed empty — next poll will retry seeding")
+                return []
+            self.collector.seed_seen(all_items)
+            self._warmup_pending = False
+            log.info(
+                "News warmup complete | seeded %d headline(s), callbacks suppressed",
+                len(all_items),
+            )
+            return []
+
         items = await self.collector.fetch_new(session)
+
         analyzed: list[AnalyzedNews] = []
         for item in items:
             score, label, probs = await asyncio.to_thread(
@@ -400,4 +449,5 @@ def _entry_dt(entry) -> datetime:
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if parsed:
         return datetime(*parsed[:6], tzinfo=timezone.utc)
-    return datetime.now(timezone.utc)
+    # 날짜 없음 → 아주 오래된 것으로 간주(신선도 필터에서 진입 제외).
+    return datetime(1970, 1, 1, tzinfo=timezone.utc)

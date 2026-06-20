@@ -98,19 +98,24 @@ class TelegramNotifier:
         entry_price: float,
         news: str,
         score: float,
+        news_ko: str = "",
+        leverage: int | None = None,
     ) -> bool:
         """포지션 오픈 알림.
 
-        요구 양식: [뉴스 내용 / 뉴스 점수 / 포지션 금액 / 코인명 / 진입가]를 모두 포함.
+        요구 양식: [뉴스 내용(영문+한글) / 뉴스 점수 / 포지션 금액 / 코인명 / 진입가]를 포함.
         """
         arrow = "🟢 LONG" if side.lower() == "long" else "🔴 SHORT"
+        lev_line = f"<b>레버리지:</b> {leverage}x\n" if leverage else ""
         text = (
             f"🚀 <b>포지션 오픈</b> {arrow}\n"
             f"<b>코인명:</b> {html.escape(symbol)}\n"
             f"<b>진입가:</b> {entry_price:,.4f}\n"
             f"<b>포지션 금액:</b> {amount_usdt:,.2f} USDT\n"
+            f"{lev_line}"
             f"<b>뉴스 점수:</b> {score:+.3f}\n"
-            f"<b>뉴스 내용:</b> {html.escape(news or 'N/A')}"
+            f"<b>뉴스(EN):</b> {html.escape(news or 'N/A')}\n"
+            f"<b>뉴스(한글):</b> {html.escape(news_ko or '번역 없음')}"
         )
         return await self.send(text)
 
@@ -126,23 +131,31 @@ class TelegramNotifier:
         reason: str,
         news: str,
         score: float,
+        pnl_usdt: float | None = None,
+        news_ko: str = "",
     ) -> bool:
         """포지션 청산 알림.
 
-        요구 양식: [뉴스 내용 / 뉴스 점수 / 포지션 금액 / 코인명 / 진입·청산가]를 모두 포함.
+        요구 양식: [뉴스 내용(영문+한글) / 뉴스 점수 / 손익(% + 금액) / 포지션 금액 /
+        코인명 / 진입·청산가]를 포함.
         """
         result_icon = "✅" if pnl_pct >= 0 else "❌"
         side_label = "LONG" if side.lower() == "long" else "SHORT"
+        if pnl_usdt is not None:
+            pnl_line = f"<b>손익:</b> {pnl_pct:+.2f}% ({pnl_usdt:+,.2f} USDT)\n"
+        else:
+            pnl_line = f"<b>손익:</b> {pnl_pct:+.2f}%\n"
         text = (
             f"🏁 <b>포지션 청산</b> {result_icon} ({side_label})\n"
             f"<b>코인명:</b> {html.escape(symbol)}\n"
             f"<b>진입가:</b> {entry_price:,.4f}\n"
             f"<b>청산가:</b> {exit_price:,.4f}\n"
-            f"<b>손익:</b> {pnl_pct:+.2f}%\n"
+            f"{pnl_line}"
             f"<b>포지션 금액:</b> {amount_usdt:,.2f} USDT\n"
             f"<b>청산 사유:</b> {html.escape(reason)}\n"
             f"<b>뉴스 점수:</b> {score:+.3f}\n"
-            f"<b>뉴스 내용:</b> {html.escape(news or 'N/A')}"
+            f"<b>뉴스(EN):</b> {html.escape(news or 'N/A')}\n"
+            f"<b>뉴스(한글):</b> {html.escape(news_ko or '번역 없음')}"
         )
         return await self.send(text)
 

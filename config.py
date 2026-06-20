@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     )
     # 뉴스 수집 폴링 주기(초 단위, 기본값 = 1분).
     news_poll_interval: int = Field(default=60, alias="NEWS_POLL_INTERVAL")
+    # 시작 후 이 시간(초)이 지나기 전·첫 RSS 워밍업 전에는 뉴스로 진입하지 않는다.
+    news_entry_grace_seconds: int = Field(default=60, alias="NEWS_ENTRY_GRACE_SEC")
+    # 진입 허용 최대 기사 나이(분). 발행 시각이 이보다 오래되면 진입하지 않는다.
+    news_max_age_minutes: float = Field(default=30.0, alias="NEWS_MAX_AGE_MINUTES")
     # 기관급 금융 감성 분석 모델의 Hugging Face 모델 ID.
     finbert_model: str = Field(default="ProsusAI/finbert", alias="FINBERT_MODEL")
     # 추론 시 torch가 사용할 CPU 스레드 수(0 = 자동/전체 코어).
@@ -79,8 +83,10 @@ class Settings(BaseSettings):
     order_time_in_force: str = Field(default="IOC", alias="ORDER_TIME_IN_FORCE")
     # 1회 진입 명목 가치(USDT 기준).
     position_size_usdt: float = Field(default=50.0, alias="POSITION_SIZE_USDT")
-    # 주문 레버리지 배수.
+    # 주문 레버리지 배수(자동 레버리지 비활성 시 사용하는 수동 값).
     leverage: int = Field(default=3, alias="LEVERAGE")
+    # 자동 레버리지: True면 뉴스 점수 강도에 따라 레버리지를 결정한다.
+    auto_leverage: bool = Field(default=True, alias="AUTO_LEVERAGE")
     # 증거금 모드(격리: isolated / 교차: cross).
     margin_mode: str = Field(default="isolated", alias="MARGIN_MODE")
 
@@ -91,12 +97,28 @@ class Settings(BaseSettings):
     trailing_atr_mult: float = Field(default=3.0, alias="TRAILING_ATR_MULT")
     # 강한 추세/뉴스 신호 발생 시 적용하는 축소된 ATR 배수(익절 라인을 바짝 당김).
     trailing_atr_mult_tight: float = Field(default=1.5, alias="TRAILING_ATR_MULT_TIGHT")
+    # Trailing stop 활성화 최소 이익(%). 이 수익률 이상일 때만 트레일링 익절이 동작한다.
+    trailing_profit_pct: float = Field(default=2.0, alias="TRAILING_PROFIT_PCT")
     # 실시간 뉴스 가중치 축소 트리거 임계값(긍정 0.7 / 부정 -0.7).
     news_score_threshold: float = Field(default=0.7, alias="NEWS_SCORE_THRESHOLD")
     # 횡보 시 시간 청산까지의 보유 시간(시간 단위).
     time_exit_hours: float = Field(default=7.0, alias="TIME_EXIT_HOURS")
     # 포지션 모니터링 주기(초).
     monitor_interval: int = Field(default=15, alias="MONITOR_INTERVAL")
+
+    # ---- FinBERT 주기적 파인튜닝(재학습) ----
+    # 자동 재학습 활성화 여부.
+    finetune_enabled: bool = Field(default=True, alias="FINETUNE_ENABLED")
+    # 재학습 주기(일). 기본 30일 = 월 1회.
+    finetune_interval_days: int = Field(default=30, alias="FINETUNE_INTERVAL_DAYS")
+    # 재학습을 시도하기 위한 최소 누적 샘플 수.
+    finetune_min_samples: int = Field(default=50, alias="FINETUNE_MIN_SAMPLES")
+    # 재학습에 사용할 최근 샘플 최대 개수(메모리/시간 절약).
+    finetune_max_samples: int = Field(default=1000, alias="FINETUNE_MAX_SAMPLES")
+    # 재학습 epoch 수(CPU 환경이므로 작게 유지).
+    finetune_epochs: int = Field(default=1, alias="FINETUNE_EPOCHS")
+    # 파인튜닝된 모델을 저장/로드할 디렉터리(프로젝트 루트 기준 상대경로 허용).
+    finetune_dir: str = Field(default="models/finbert-finetuned", alias="FINETUNE_DIR")
 
     @field_validator("log_level")
     @classmethod
@@ -121,6 +143,20 @@ class Settings(BaseSettings):
     def _validate_poll_interval(cls, value: int) -> int:
         if value < 10:
             raise ValueError("NEWS_POLL_INTERVAL must be >= 10 seconds")
+        return value
+
+    @field_validator("news_entry_grace_seconds")
+    @classmethod
+    def _validate_entry_grace(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("NEWS_ENTRY_GRACE_SEC must be >= 0")
+        return value
+
+    @field_validator("news_max_age_minutes")
+    @classmethod
+    def _validate_news_max_age(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("NEWS_MAX_AGE_MINUTES must be >= 0")
         return value
 
     @field_validator("order_time_in_force")
@@ -160,6 +196,14 @@ class Settings(BaseSettings):
     def log_path(self) -> Path:
         """로그 디렉터리의 절대 경로(로거가 지연 생성)."""
         path = Path(self.log_dir)
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        return path
+
+    @property
+    def finetune_path(self) -> Path:
+        """파인튜닝 모델 저장 디렉터리의 절대 경로."""
+        path = Path(self.finetune_dir)
         if not path.is_absolute():
             path = BASE_DIR / path
         return path

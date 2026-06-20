@@ -7,6 +7,9 @@
 logs/
 *.log
 
+# ---- Fine-tuned models & training samples (large / local) ----
+models/
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

@@ -254,16 +254,38 @@ class TradingEngine:
             return []
         return [p for p in positions if abs(float(p.get("contracts") or 0)) > 0]
 
+    async def flatten_all(self) -> list[str]:
+        """거래소의 모든 오픈 포지션을 시장가(reduceOnly)로 청산한다.
+
+        시작 시 '봇이 추적하지 않는 잔여 포지션(수동 청산 가정)'을 정리하기 위해
+        사용한다. 청산에 성공한 심볼 목록을 반환한다.
+        """
+        closed: list[str] = []
+        for p in await self.fetch_open_positions():
+            symbol = p.get("symbol")
+            raw_side = (p.get("side") or "").lower()
+            contracts = abs(float(p.get("contracts") or 0))
+            if not symbol or raw_side not in ("long", "short") or contracts <= 0:
+                continue
+            result = await self.close_position(symbol, raw_side, contracts, order_type="market")  # type: ignore[arg-type]
+            if result.is_filled:
+                closed.append(symbol)
+                log.info("Startup flatten | closed %s %s x%.6f", symbol, raw_side, contracts)
+            else:
+                log.warning("Startup flatten failed | %s | %s", symbol, result.reason)
+        return closed
+
     # ---- 주문 ----
-    async def _prepare_symbol(self, symbol: str) -> None:
+    async def _prepare_symbol(self, symbol: str, leverage: int | None = None) -> None:
         """주문 전 증거금 모드(격리/교차)와 레버리지를 설정한다."""
+        lev = int(leverage) if leverage else self.leverage
         # 증거금 모드 설정(이미 동일 모드면 거래소가 에러를 내므로 무시).
         try:
             await self.exchange.set_margin_mode(self.margin_mode, symbol)
         except Exception as exc:  # noqa: BLE001 - 이미 설정된 경우 정상
             log.debug("set_margin_mode skipped | %s | %s: %s", symbol, type(exc).__name__, exc)
         try:
-            await self.exchange.set_leverage(self.leverage, symbol)
+            await self.exchange.set_leverage(lev, symbol)
         except Exception as exc:  # noqa: BLE001 - 이미 설정돼 있으면 무시 가능
             log_exception(log, exc, context="set_leverage", symbol=symbol)
 
@@ -281,12 +303,22 @@ class TradingEngine:
             return None
         return float(bids[0][0]), float(asks[0][0])
 
-    async def enter_position(self, symbol: str, side: Side) -> OrderResult:
+    async def enter_position(
+        self,
+        symbol: str,
+        side: Side,
+        *,
+        leverage: int | None = None,
+        notional: float | None = None,
+    ) -> OrderResult:
         """가변형 시장 지정가 방식으로 Long/Short 진입을 시도한다.
 
         동시 포지션 한도를 먼저 확인하고, 호가를 가로지르는 IOC/FOK 지정가
         주문을 제출한다. 미체결분이 남으면 사유를 로깅하고 즉시 취소한다.
         체결에 성공하면 포지션 카운터를 증가시킨다.
+
+        ``leverage`` / ``notional`` 을 주면 해당 진입에만 적용한다(실시간 설정·자동
+        레버리지 반영). 생략 시 엔진 기본값(설정 스냅샷)을 사용한다.
         """
         async with self._lock:
             # ---- 동시 포지션 카운터 검사 ----
@@ -305,7 +337,9 @@ class TradingEngine:
             # 한도 내 슬롯을 선점하기 위해 카운터에 임시 등록(체결 실패 시 롤백).
             self._open_positions[symbol] = side
 
-        result = await self._submit_marketable_limit(symbol, side)
+        result = await self._submit_marketable_limit(
+            symbol, side, leverage=leverage, notional=notional
+        )
 
         # 체결 실패 시 선점한 슬롯을 롤백한다.
         if not result.is_filled:
@@ -324,9 +358,40 @@ class TradingEngine:
                 )
         return result
 
-    async def _submit_marketable_limit(self, symbol: str, side: Side) -> OrderResult:
+    async def increase_position(
+        self,
+        symbol: str,
+        side: Side,
+        *,
+        leverage: int | None = None,
+        notional: float | None = None,
+    ) -> OrderResult:
+        """기존 포지션에 같은 방향으로 추가 진입(피라미딩)한다.
+
+        동시 포지션 카운터는 이미 해당 심볼이 점유 중이므로 건드리지 않고,
+        주문만 추가로 제출한다. 레버리지를 주면 추가 분에 맞춰 재설정한다.
+        """
+        result = await self._submit_marketable_limit(
+            symbol, side, leverage=leverage, notional=notional
+        )
+        if result.is_filled:
+            log.info(
+                "Position increased | %s %s | add_filled=%.6f @ %.4f",
+                symbol, side, result.filled_amount, result.price,
+            )
+        return result
+
+    async def _submit_marketable_limit(
+        self,
+        symbol: str,
+        side: Side,
+        *,
+        leverage: int | None = None,
+        notional: float | None = None,
+    ) -> OrderResult:
         """호가를 가로지르는 지정가(IOC/FOK) 주문을 제출하고 결과를 평가한다."""
-        await self._prepare_symbol(symbol)
+        await self._prepare_symbol(symbol, leverage=leverage)
+        notional_usdt = float(notional) if notional else self.notional_usdt
 
         quote = await self._best_quote(symbol)
         if quote is None:
@@ -343,7 +408,7 @@ class TradingEngine:
             limit_price = best_bid
 
         # 명목 가치(USDT)를 수량으로 환산하고 거래소 정밀도에 맞춰 반올림한다.
-        raw_amount = self.notional_usdt / limit_price
+        raw_amount = notional_usdt / limit_price
         try:
             amount = float(self.exchange.amount_to_precision(symbol, raw_amount))
             price = float(self.exchange.price_to_precision(symbol, limit_price))
