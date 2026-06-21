@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -52,6 +53,8 @@ st.markdown(
         color: #e6edf3;
     }
     .news-ko { color: #b0b8c4; font-size: 0.84rem; }
+    .news-meta { color: #8b949e; font-size: 0.76rem; display: block; margin-bottom: 0.15rem; }
+    .news-meta b { color: #a8b3cf; font-weight: 600; }
     .news-item sub { color: #8b949e; }
     .news-item code {
         background: rgba(110, 118, 129, 0.2); color: #c9d1d9;
@@ -221,6 +224,24 @@ def _bot_status_compact() -> tuple[str, str]:
     if STATE.running:
         return "🟡 기동 중", "스레드 대기"
     return "⚪ 대기", "▶ 시작 필요"
+
+
+def _news_time_meta(nw) -> str:
+    """뉴스 항목 메타: 발행·수신 시각(KST) + RSS 출처."""
+    pub_ms = int(getattr(nw, "published_at_ms", 0) or 0)
+    recv_ms = int(getattr(nw, "at_ms", 0) or 0)
+    pub_hms = (
+        format_gui_hms(at_ms=pub_ms)
+        if pub_ms
+        else format_gui_hms(stored=getattr(nw, "time", "") or "")
+    ) or "—"
+    recv_hms = format_gui_hms(at_ms=recv_ms) if recv_ms else "—"
+    source = html.escape((getattr(nw, "source", "") or "").strip()) or "—"
+    return (
+        f'<span class="news-meta">'
+        f"발행 <code>{pub_hms}</code> · 수신 <code>{recv_hms}</code> {TZ_LABEL}"
+        f' · 출처 <b>{source}</b></span>'
+    )
 
 
 def render_sidebar() -> None:
@@ -855,7 +876,7 @@ def render_dashboard() -> None:
     n_col, l_col = st.columns(2)
 
     with n_col:
-        st.caption(f"실시간 뉴스 (EN + 한글) · 시간 {TZ_LABEL}")
+        st.caption(f"실시간 뉴스 (EN + 한글) · 발행/수신 {TZ_LABEL}")
         news = STATE.get_news(30)
         with st.container(height=_NEWS_LOG_HEIGHT):
             if not news:
@@ -864,11 +885,10 @@ def render_dashboard() -> None:
                 icon = "🟢" if nw.score > 0.2 else "🔴" if nw.score < -0.2 else "⚪"
                 ko = nw.title_ko or nw.title
                 st.markdown(
-                    f'<div class="news-item">{icon} <code>{format_gui_hms(at_ms=int(getattr(nw, "published_at_ms", 0) or getattr(nw, "at_ms", 0) or 0), stored=nw.time)}</code> '
-                    f"<b>[{nw.score:+.2f} {nw.label}]</b><br>"
-                    f"🇺🇸 {nw.title}<br>"
-                    f'<span class="news-ko">🇰🇷 {ko}</span><br>'
-                    f"<sub>{nw.source}</sub></div>",
+                    f'<div class="news-item">{icon} {_news_time_meta(nw)}<br>'
+                    f"<b>[{nw.score:+.2f} {nw.label}]</b> "
+                    f"🇺🇸 {html.escape(nw.title)}<br>"
+                    f'<span class="news-ko">🇰🇷 {html.escape(ko)}</span></div>',
                     unsafe_allow_html=True,
                 )
 

@@ -2,9 +2,9 @@
 
 서로 협력하는 세 가지 구성요소를 제공한다.
 
-  * :class:`NewsCollector`   - CryptoPanic API(토큰이 설정된 경우) 또는 무료
-    공개 RSS 피드에서 암호화폐 뉴스를 비동기로 폴링하며, 이미 처리한 항목은
-    중복 제거한다.
+  * :class:`NewsCollector`   - CryptoPanic API(토큰이 설정된 경우) 또는 무료 공개
+    RSS 피드(기본 16+개)를 비동기로 폴링하며, URL/제목 기준 중복 제거 후
+    이미 처리한 항목은 seen 으로 필터한다.
   * :class:`SentimentAnalyzer` - 기관급 금융 특화 감성 모델(기본
     ``ProsusAI/finbert``)을 로드하여 영문 텍스트를 ``-1.0``(매우 부정)에서
     ``+1.0``(매우 긍정)까지 연속 점수로 평가한다. 추론은 일반 CPU에 맞춰
@@ -41,10 +41,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Iterable
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 import feedparser
@@ -60,6 +62,20 @@ DEFAULT_RSS_FEEDS: tuple[str, ...] = (
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://decrypt.co/feed",
     "https://bitcoinmagazine.com/feed",
+    "https://www.theblock.co/rss.xml",
+    "https://blockworks.co/feed/",
+    "https://u.today/rss",
+    "https://news.bitcoin.com/feed/",
+    "https://beincrypto.com/feed/",
+    "https://www.newsbtc.com/feed/",
+    "https://ambcrypto.com/feed/",
+    "https://cryptopotato.com/feed/",
+    "https://coinjournal.net/feed/",
+    "https://crypto.news/feed/",
+    "https://bitcoinist.com/feed/",
+    "https://cryptoslate.com/feed/",
+    "https://dailyhodl.com/feed/",
+    "https://www.cryptoglobe.com/latest/feed/",
 )
 
 CRYPTOPANIC_URL = "https://cryptopanic.com/api/v1/posts/"
@@ -81,6 +97,7 @@ class NewsItem:
     url: str
     source: str
     published_at: datetime
+    origin: str = "unknown"  # rss | cryptopanic
 
 
 @dataclass(slots=True)
@@ -114,12 +131,23 @@ class NewsCollector:
         max_seen: int = 5000,
     ) -> None:
         self._token = settings.cryptopanic_token
-        self._rss_feeds = tuple(rss_feeds) if rss_feeds else DEFAULT_RSS_FEEDS
+        override = settings.rss_feed_urls
+        if rss_feeds is not None:
+            self._rss_feeds = tuple(rss_feeds)
+        elif override:
+            self._rss_feeds = override
+        else:
+            self._rss_feeds = DEFAULT_RSS_FEEDS
+
         # 메모리 무한 증가를 막기 위한 한도 있는 LRU 형태의 seen 집합.
         self._seen: "OrderedDict[str, None]" = OrderedDict()
         self._max_seen = max_seen
         self._source_mode = "cryptopanic" if self._token else "rss"
-        log.info("NewsCollector ready | mode=%s", self._source_mode)
+        log.info(
+            "NewsCollector ready | mode=%s | feeds=%d",
+            self._source_mode,
+            len(self._rss_feeds),
+        )
 
     # ---- 공개 API ----
     async def fetch_new(self, session: aiohttp.ClientSession) -> list[NewsItem]:
@@ -129,14 +157,24 @@ class NewsCollector:
         for it in fresh:
             self._mark_seen(it.id)
         if fresh:
-            log.info("Collected %d new headline(s) | mode=%s", len(fresh), self._source_mode)
+            by_origin: dict[str, int] = {}
+            for it in fresh:
+                by_origin[it.origin] = by_origin.get(it.origin, 0) + 1
+            parts = " ".join(f"{k}={v}" for k, v in sorted(by_origin.items()))
+            log.info(
+                "Collected %d new headline(s) | mode=%s | %s",
+                len(fresh),
+                self._source_mode,
+                parts,
+            )
         return fresh
 
     async def fetch_all(self, session: aiohttp.ClientSession) -> list[NewsItem]:
-        """피드의 모든 헤드라인을 반환한다(중복 제거·seen 갱신 없음)."""
+        """모든 소스에서 헤드라인을 수집·병합한다(seen 갱신 없음)."""
         if self._token:
             return await self._fetch_cryptopanic(session)
-        return await self._fetch_rss(session)
+        items = await self._fetch_rss(session)
+        return _dedupe_items(items)
 
     def seed_seen(self, items: list[NewsItem]) -> int:
         """워밍업: 목록의 모든 ID 를 seen 에 등록한다."""
@@ -174,13 +212,16 @@ class NewsCollector:
             title = (post.get("title") or "").strip()
             if not title:
                 continue
+            url = post.get("url", "") or ""
+            raw_id = str(post.get("id") or _hash(title))
             items.append(
                 NewsItem(
-                    id=str(post.get("id") or _hash(title)),
+                    id=_stable_item_id(url, title, raw_id),
                     title=title,
-                    url=post.get("url", ""),
+                    url=url,
                     source=(post.get("source") or {}).get("title", "CryptoPanic"),
                     published_at=_parse_dt(post.get("published_at")),
+                    origin="cryptopanic",
                 )
             )
         return items
@@ -212,15 +253,16 @@ class NewsCollector:
             title = (entry.get("title") or "").strip()
             if not title:
                 continue
-            link = entry.get("link", "")
+            link = entry.get("link", "") or ""
             uid = entry.get("id") or link or _hash(title)
             items.append(
                 NewsItem(
-                    id=str(uid),
+                    id=_stable_item_id(link, title, str(uid)),
                     title=title,
                     url=link,
                     source=source,
                     published_at=_entry_dt(entry),
+                    origin="rss",
                 )
             )
         return items
@@ -434,6 +476,42 @@ class NewsAnalyzer:
 # --------------------------------------------------------------------------- #
 def _hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _normalize_title(title: str) -> str:
+    return re.sub(r"\s+", " ", (title or "").strip().lower())
+
+
+def _normalize_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url.lower())
+    path = parsed.path.rstrip("/") or "/"
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+
+def _stable_item_id(url: str, title: str, fallback: str) -> str:
+    """소스 간 중복 제거·seen 키로 쓸 안정 ID(URL 우선, 없으면 제목 해시)."""
+    norm_url = _normalize_url(url)
+    if norm_url:
+        return norm_url
+    norm_title = _normalize_title(title)
+    if norm_title:
+        return f"title:{_hash(norm_title)}"
+    return fallback
+
+
+def _dedupe_items(items: list[NewsItem]) -> list[NewsItem]:
+    """URL·제목 기준 중복 제거. 동일 기사면 published_at 이 더 이른 항목 유지."""
+    by_key: dict[str, NewsItem] = {}
+    for item in items:
+        norm_url = _normalize_url(item.url)
+        key = norm_url or f"title:{_hash(_normalize_title(item.title))}"
+        existing = by_key.get(key)
+        if existing is None or item.published_at < existing.published_at:
+            by_key[key] = item
+    return list(by_key.values())
 
 
 def _parse_dt(value: str | None) -> datetime:

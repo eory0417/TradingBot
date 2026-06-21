@@ -13,7 +13,7 @@ secure configuration, and the verified-library foundation modules
 | `logger.py`        |   1   | Standardized console + rotating-file logging, error reporting helper. |
 | `exchange.py`      |   1   | Async `ccxt` Binance USDⓈ-M futures client init (testnet supported).  |
 | `notifier.py`      |   1   | Async Telegram alerts via `python-telegram-bot`.                      |
-| `news_analyzer.py` |   2   | Async news collection (CryptoPanic/RSS) + FinBERT sentiment scoring.  |
+| `news_analyzer.py` |   2   | RSS news ingestion (16+ feeds) + FinBERT sentiment scoring.             |
 | `trading_engine.py`|   3   | `pandas_ta` RSI/ATR + slope, marketable-limit Long/Short order engine.|
 | `strategy.py`      |   4   | Dynamic trailing-stop / fixed-stop / time-exit (Long/Short symmetric).|
 | `bot.py`           |   4   | Core trading loop: news + indicators + strategy orchestration.        |
@@ -25,9 +25,14 @@ secure configuration, and the verified-library foundation modules
 
 `news_analyzer.py` provides three pieces:
 
-- **`NewsCollector`** — asynchronously polls the **CryptoPanic API** (when
-  `CRYPTOPANIC_API_TOKEN` is set) or free public **RSS feeds** (Cointelegraph,
-  CoinDesk, Decrypt, Bitcoin Magazine) otherwise, de-duplicating seen items.
+- **`NewsCollector`** — asynchronously polls news sources:
+  - **RSS** (default **16+ free feeds**: Cointelegraph, CoinDesk, Decrypt, Bitcoin
+    Magazine, The Block, Blockworks, NewsBTC, AMBCrypto, CryptoPotato, CoinJournal,
+    Crypto.news, Bitcoinist, CryptoSlate, U.Today, BeInCrypto, …). Override with
+    comma-separated `NEWS_RSS_FEEDS`.
+  - **CryptoPanic API** (optional token) — when `CRYPTOPANIC_API_TOKEN` is set,
+    it is used instead of RSS.
+  - URL/title de-duplication across feeds.
 - **`SentimentAnalyzer`** — loads the institutional finance-tuned model
   `ProsusAI/finbert` and scores English text from **-1.0 (very negative)** to
   **+1.0 (very positive)** as `P(positive) - P(negative)`. CPU inference is
@@ -36,6 +41,13 @@ secure configuration, and the verified-library foundation modules
 - **`NewsAnalyzer`** — orchestrates a **1-minute polling loop** (configurable
   via `NEWS_POLL_INTERVAL`) that collects fresh news, scores it, and invokes a
   callback per analyzed headline.
+
+### Recommended `.env` for maximum headline coverage (free)
+
+```env
+NEWS_POLL_INTERVAL=30
+# NEWS_RSS_FEEDS=   # optional override; blank uses built-in 16+ feeds
+```
 
 ```python
 import asyncio

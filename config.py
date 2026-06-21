@@ -56,11 +56,12 @@ class Settings(BaseSettings):
     log_dir: str = Field(default="logs", alias="LOG_DIR")
 
     # ---- 뉴스 수집 & NLP ----
-    # CryptoPanic API 토큰은 선택 사항이며, 비어 있으면 분석기는 무료 공개 RSS
-    # 피드로 자동 전환한다.
+    # CryptoPanic API 토큰은 선택 사항(설정 시 CryptoPanic 단독 모드 우선).
     cryptopanic_api_token: SecretStr = Field(
         default=SecretStr(""), alias="CRYPTOPANIC_API_TOKEN"
     )
+    # 선택: 쉼표 구분 RSS URL 오버라이드(비어 있으면 기본 16+ 피드 목록).
+    news_rss_feeds: str = Field(default="", alias="NEWS_RSS_FEEDS")
     # 뉴스 수집 폴링 주기(초 단위, 기본값 = 1분).
     news_poll_interval: int = Field(default=60, alias="NEWS_POLL_INTERVAL")
     # 시작 후 이 시간(초)이 지나기 전·첫 RSS 워밍업 전에는 뉴스로 진입하지 않는다.
@@ -179,6 +180,14 @@ class Settings(BaseSettings):
     def cryptopanic_token(self) -> str:
         """CryptoPanic 토큰을 평문 문자열로 반환(미설정 시 '')."""
         return self.cryptopanic_api_token.get_secret_value().strip()
+
+    @property
+    def rss_feed_urls(self) -> tuple[str, ...]:
+        """RSS 피드 URL 목록(NEWS_RSS_FEEDS 오버라이드 또는 기본값)."""
+        raw = self.news_rss_feeds.strip()
+        if not raw:
+            return ()
+        return tuple(u.strip() for u in raw.split(",") if u.strip())
 
     @property
     def symbols(self) -> list[str]:
