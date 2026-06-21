@@ -408,11 +408,26 @@ class NewsAnalyzer:
         self._running = False
         # 시작 직후 첫 폴링: 피드에 남은 기존 기사는 seen 만 등록, 진입/콜백 생략.
         self._warmup_pending = True
+        self._last_warmup_count = 0
+        self._on_status: Callable[[str], None] | None = None
 
-    async def start(self, callback: NewsCallback) -> None:
+    async def start(
+        self,
+        callback: NewsCallback,
+        on_status: Callable[[str], None] | None = None,
+    ) -> None:
         """폴링 루프를 영구 실행하며, 분석된 항목마다 ``callback``을 호출한다."""
+
+        def _status(msg: str) -> None:
+            log.info(msg)
+            if on_status is not None:
+                on_status(msg)
+
+        self._on_status = on_status
         # 첫 폴링이 빠르도록 루프 시작 전에 모델을 한 번 워밍업한다.
+        _status("FinBERT 모델 로딩 중 (첫 실행 시 ~438MB 다운로드, 완료 후 RSS 수집 시작)")
         await asyncio.to_thread(self.sentiment.load)
+        _status("FinBERT 로딩 완료 — RSS 폴링 시작")
         self._running = True
         log.info("NewsAnalyzer loop started | interval=%ds", self._interval)
 
@@ -449,10 +464,15 @@ class NewsAnalyzer:
                 return []
             self.collector.seed_seen(all_items)
             self._warmup_pending = False
+            self._last_warmup_count = len(all_items)
             log.info(
                 "News warmup complete | seeded %d headline(s), callbacks suppressed",
                 len(all_items),
             )
+            if self._on_status is not None:
+                self._on_status(
+                    f"뉴스 워밍업 완료 ({len(all_items)}건 등록) — 이후 신규 기사만 표시"
+                )
             return []
 
         items = await self.collector.fetch_new(session)

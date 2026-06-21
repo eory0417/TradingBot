@@ -30,7 +30,7 @@ import pandas as pd
 
 import finetune
 from config import settings
-from logger import get_logger, log_exception
+from logger import format_exception_brief, get_logger, log_exception
 from news_analyzer import AnalyzedNews, NewsAnalyzer
 from state import STATE, NewsView, PositionView
 from strategy import ExitSignal, Position, Side
@@ -219,7 +219,12 @@ class TradingBot:
                 f"시작 후 {settings.news_entry_grace_seconds}초 경과 + "
                 f"발행 {settings.news_max_age_minutes:.0f}분 이내 기사만 진입",
             )
-            news_task = asyncio.create_task(self.news.start(self._on_news))
+            news_task = asyncio.create_task(
+                self.news.start(
+                    self._on_news,
+                    on_status=lambda msg: self._emit_log("INFO", "system", msg),
+                )
+            )
             monitor_task = asyncio.create_task(self._monitor_loop())
             finetune_task = asyncio.create_task(self._finetune_loop())
             await asyncio.gather(news_task, monitor_task, finetune_task)
@@ -250,11 +255,22 @@ class TradingBot:
             self._emit_log("INFO", "system", "SIM 모드: 합성 시장 + 페이퍼 잔고 10,000 USDT (무포지션 시작)")
             return
         # LIVE 모드: 실제 거래소/알림 구성.
-        from exchange import create_exchange, load_markets_safe
+        from exchange import create_exchange, diagnose_exchange, load_markets_safe
         from notifier import TelegramNotifier
 
         self.exchange = create_exchange()
-        await load_markets_safe(self.exchange)
+        try:
+            diag_lines = await diagnose_exchange(self.exchange)
+        except Exception as exc:  # noqa: BLE001
+            log_exception(log, exc, context="diagnose_exchange")
+            diag_lines = [f"진단 중단: {format_exception_brief(exc)}"]
+        for line in diag_lines:
+            log.info("연결 진단 | %s", line)
+            self._emit_log("INFO", "system", f"연결 진단: {line}")
+
+        markets_ok, market_err = await load_markets_safe(self.exchange)
+        if not markets_ok:
+            self._emit_log("ERROR", "system", f"마켓 로드 실패:\n{market_err or 'unknown'}")
         self.notifier = TelegramNotifier()
         self.engine = TradingEngine(self.exchange, notifier=self.notifier)
 
@@ -279,7 +295,7 @@ class TradingBot:
         bal, bal_err = await self.engine.fetch_balance_usdt()
         self.state.set_balance(bal)
         if bal_err:
-            self._emit_log("ERROR", "system", f"잔고 조회 실패: {bal_err}")
+            self._emit_log("ERROR", "system", f"잔고 조회 실패:\n{bal_err}")
         elif exchange_mode_label() == "DEMO" and bal == 0.0:
             self._emit_log(
                 "WARNING", "system",

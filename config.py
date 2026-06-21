@@ -16,15 +16,19 @@
 
 from __future__ import annotations
 
+import sys
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# 프로젝트 루트(이 파일이 위치한 디렉터리). 현재 작업 디렉터리와 무관하게
-# .env 파일과 logs 디렉터리 경로를 해석하는 데 사용한다.
-BASE_DIR: Path = Path(__file__).resolve().parent
+# 프로젝트 루트. PyInstaller exe는 _internal 이 아닌 exe 옆 폴더를 기준으로
+# .env · logs · models 경로를 해석한다.
+if getattr(sys, "frozen", False):
+    BASE_DIR: Path = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 
 
 class Settings(BaseSettings):

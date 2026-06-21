@@ -44,8 +44,20 @@ async def main() -> None:
     exchange = create_exchange()
     try:
         if _has_real_credentials():
-            ok = await load_markets_safe(exchange)
-            log.info("Exchange connectivity: %s", "OK" if ok else "FAILED")
+            ok, market_err = await load_markets_safe(exchange)
+            log.info("Exchange load_markets: %s", "OK" if ok else "FAILED")
+            if market_err:
+                log.error("load_markets detail:\n%s", market_err)
+            try:
+                await exchange.publicGetPing()
+                log.info("Binance public ping: OK")
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "Binance public ping FAILED (%s: %s) — "
+                    "방화벽·IP 화이트리스트·api.binance.com 차단 여부 확인",
+                    type(exc).__name__,
+                    exc,
+                )
         else:
             log.warning(
                 "Skipping live exchange call: placeholder credentials detected. "

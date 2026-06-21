@@ -302,14 +302,14 @@ def render_sidebar() -> None:
     col1, col2 = st.sidebar.columns(2)
     running = runner.is_alive() or STATE.running
     if col1.button(
-        "▶ 시작", use_container_width=True, type="primary", disabled=running,
+        "▶ 시작", width="stretch", type="primary", disabled=running,
     ):
         mode = botmod.exchange_mode_label()
         STATE.set_running(True, status=f"시작 중 ({mode})")
         STATE.log("INFO", "system", "▶ 시작 버튼 — 봇 초기화 중 (FinBERT·거래소 연결)")
         runner.start()
         st.rerun()
-    if col2.button("■ 정지", use_container_width=True, disabled=not running):
+    if col2.button("■ 정지", width="stretch", disabled=not running):
         runner.stop()
         STATE.log("INFO", "system", "■ 정지 버튼 — 봇 종료 요청")
         st.rerun()
@@ -330,7 +330,7 @@ def render_sidebar() -> None:
     st.sidebar.caption(f"🧠 FinBERT 재학습 · 누적 샘플 {finetune.sample_count()}건")
     bot = getattr(runner, "bot", None)
     if st.sidebar.button(
-        "🔄 모델 재학습(수동)", use_container_width=True,
+        "🔄 모델 재학습(수동)", width="stretch",
         disabled=bot is None, help="월 1회 자동 재학습. 지금 즉시 실행하려면 클릭.",
     ):
         if bot is not None:
@@ -612,7 +612,7 @@ def chart_dialog() -> None:
         timeframe=tf, show_legend=True,
     )
     if fig is not None:
-        st.plotly_chart(fig, use_container_width=True, key=f"zoom_chart_{_sym_key(sym)}_{tf}")
+        st.plotly_chart(fig, width="stretch", key=f"zoom_chart_{_sym_key(sym)}_{tf}")
     else:
         st.caption("차트 데이터를 불러오지 못했습니다. 잠시 후 다시 시도하세요.")
 
@@ -740,7 +740,7 @@ def stats_dialog() -> None:
         grp["평균손익률"] = grp["평균손익률"].round(2)
         st.dataframe(
             grp[["코인", "거래수", "승", "승률%", "총손익USDT", "평균손익률"]],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
 
         st.markdown("##### 청산 거래 내역")
@@ -758,7 +758,7 @@ def stats_dialog() -> None:
         st.dataframe(
             hist[["시각", "symbol", "side", "leverage", "진입", "청산", "손익%", "손익USDT", "exit_type"]]
             .rename(columns={"symbol": "코인", "side": "방향", "leverage": "배율", "exit_type": "사유"}),
-            use_container_width=True, hide_index=True, height=220,
+            width="stretch", hide_index=True, height=220,
         )
     else:
         st.info("선택한 기간에 청산된 거래가 없습니다.")
@@ -774,9 +774,9 @@ def stats_dialog() -> None:
             "미실현%": p.unrealized_pct,
             "미실현USDT": round(p.notional * p.unrealized_pct / 100, 2),
         } for p in open_pos])
-        st.dataframe(odf, use_container_width=True, hide_index=True)
+        st.dataframe(odf, width="stretch", hide_index=True)
 
-    if st.button("닫기", use_container_width=True):
+    if st.button("닫기", width="stretch"):
         st.rerun()
 
 
@@ -847,14 +847,14 @@ def render_dashboard() -> None:
                 f'<div class="pos-row" style="color:{pnl_color}"><b>{p.unrealized_pct:+.2f}%</b></div>',
                 unsafe_allow_html=True,
             )
-            if rc[9].button("청산", key=f"close_{_sym_key(p.symbol)}", use_container_width=True):
+            if rc[9].button("청산", key=f"close_{_sym_key(p.symbol)}", width="stretch"):
                 _handle_manual_close(p.symbol)
     else:
         st.caption("오픈 포지션 없음")
 
     ch_head, ch_btn = st.columns([4, 1])
     ch_head.markdown("##### 📈 차트 (15m)")
-    if ch_btn.button("📊 수익률 통계", use_container_width=True, key="stats_btn"):
+    if ch_btn.button("📊 수익률 통계", width="stretch", key="stats_btn"):
         st.session_state["pending_dialog"] = ("stats", None)
         st.rerun()
     open_syms = [p.symbol for p in positions]
@@ -865,8 +865,8 @@ def render_dashboard() -> None:
         for col, sym in zip(cols, chart_syms):
             fig = candlestick(sym)
             if fig is not None:
-                col.plotly_chart(fig, use_container_width=True, key=f"chart_{_sym_key(sym)}")
-                if col.button("🔍 크게 보기", key=f"zoom_btn_{_sym_key(sym)}", use_container_width=True):
+                col.plotly_chart(fig, width="stretch", key=f"chart_{_sym_key(sym)}")
+                if col.button("🔍 크게 보기", key=f"zoom_btn_{_sym_key(sym)}", width="stretch"):
                     st.session_state["pending_dialog"] = ("chart", sym)
                     st.rerun()
     else:
@@ -880,7 +880,9 @@ def render_dashboard() -> None:
         news = STATE.get_news(30)
         with st.container(height=_NEWS_LOG_HEIGHT):
             if not news:
-                st.caption("뉴스 수집 대기 중…")
+                st.caption(
+                    "뉴스 수집 대기 중… (FinBERT 로딩·워밍업 후 **신규** RSS 기사만 표시)"
+                )
             for nw in news:
                 icon = "🟢" if nw.score > 0.2 else "🔴" if nw.score < -0.2 else "⚪"
                 ko = nw.title_ko or nw.title
@@ -905,10 +907,11 @@ def render_dashboard() -> None:
                     at_ms=int(lg.get("time_ms", 0) or 0),
                     stored=str(lg.get("time", "")),
                 )
+                msg = html.escape(str(lg.get("message", ""))).replace("\n", "<br>")
                 st.markdown(
                     f'<div class="log-item {cls}">{badge}{icon} '
                     f'<code>{time_hms}</code> '
-                    f"<b>[{lg['category']}]</b> {lg['message']}</div>",
+                    f"<b>[{lg['category']}]</b> {msg}</div>",
                     unsafe_allow_html=True,
                 )
 

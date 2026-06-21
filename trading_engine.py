@@ -46,7 +46,7 @@ import pandas as pd
 import pandas_ta as ta
 
 from config import settings
-from logger import get_logger, log_exception
+from logger import format_exception_detail, get_logger, log_exception
 
 log = get_logger(__name__)
 
@@ -228,12 +228,32 @@ class TradingEngine:
         반환값: (잔고, 오류 메시지). 오류 시 잔고는 0.0이고 두 번째 값에 사유가 담긴다.
         """
         try:
-            balance = await self.exchange.fetch_balance()
+            balance = await self.exchange.fetch_balance({"type": "future"})
             usdt = balance.get("USDT", {})
-            return float(usdt.get("free") or usdt.get("total") or 0.0), None
+            free = float(usdt.get("free") or usdt.get("total") or 0.0)
+            if free > 0:
+                return free, None
         except Exception as exc:  # noqa: BLE001
             log_exception(log, exc, context="fetch_balance")
-            return 0.0, f"{type(exc).__name__}: {exc}"
+            first_err = format_exception_detail(exc)
+        else:
+            first_err = None
+
+        # fetch_balance 실패 또는 0일 때 fapi 잔고 API 직접 시도.
+        try:
+            raw = await self.exchange.fapiPrivateV2GetBalance()
+            for item in raw:
+                if str(item.get("asset", "")).upper() == "USDT":
+                    free = float(item.get("availableBalance") or item.get("balance") or 0.0)
+                    return free, None
+        except Exception as exc:  # noqa: BLE001
+            log_exception(log, exc, context="fetch_balance_fapi")
+            second_err = format_exception_detail(exc)
+            if first_err:
+                return 0.0, f"{first_err}\n--- fapi fallback ---\n{second_err}"
+            return 0.0, second_err
+
+        return 0.0, first_err
 
     async def fetch_mark_price(self, symbol: str) -> float | None:
         """심볼의 현재 마크/체결 가격을 조회한다."""

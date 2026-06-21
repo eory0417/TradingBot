@@ -113,6 +113,68 @@ def _extract_error_code(exc: BaseException) -> str:
     return "N/A"
 
 
+def _ccxt_extra_fields(exc: BaseException) -> list[str]:
+    """ccxt/aiohttp 예외에서 추가 필드를 추출한다."""
+    out: list[str] = []
+    for attr in ("url", "method", "http_status", "code"):
+        value = getattr(exc, attr, None)
+        if value is not None:
+            out.append(f"{attr}={value}")
+    return out
+
+
+def format_exception_brief(exc: BaseException) -> str:
+    """GUI 한 줄 요약 — 최상위 예외 + 직접 원인(cause) 1단계."""
+    head = f"{type(exc).__name__}: {exc}"
+    extra = _ccxt_extra_fields(exc)
+    if extra:
+        head += " (" + ", ".join(extra) + ")"
+    cause = exc.__cause__
+    if cause is not None:
+        tail = f"{type(cause).__name__}: {cause}"
+        if tail not in head:
+            head += f" | 원인: {tail}"
+    return head
+
+
+def format_exception_detail(exc: BaseException, *, max_chain: int = 6) -> str:
+    """파일/GUI용 다줄 진단 — 예외 체인·ccxt 필드·SSL 환경."""
+    import os
+    import sys
+
+    lines: list[str] = [
+        f"type={type(exc).__name__}",
+        f"message={exc!s}",
+    ]
+    lines.extend(_ccxt_extra_fields(exc))
+
+    seen: set[int] = {id(exc)}
+    cause: BaseException | None = exc
+    depth = 0
+    while cause is not None and depth < max_chain:
+        nxt = cause.__cause__ or cause.__context__
+        if nxt is None or id(nxt) in seen:
+            break
+        seen.add(id(nxt))
+        depth += 1
+        cause = nxt
+        lines.append(f"cause[{depth}]={type(cause).__name__}: {cause!s}")
+        lines.extend(_ccxt_extra_fields(cause))
+
+    if getattr(sys, "frozen", False):
+        lines.append(f"pyinstaller_frozen=True exe={sys.executable}")
+    lines.append(f"SSL_CERT_FILE={os.environ.get('SSL_CERT_FILE', '(unset)')}")
+    lines.append(f"REQUESTS_CA_BUNDLE={os.environ.get('REQUESTS_CA_BUNDLE', '(unset)')}")
+    try:
+        import certifi
+
+        lines.append(f"certifi_bundle={certifi.where()}")
+    except ImportError:
+        lines.append("certifi_bundle=(not installed)")
+
+    return "\n".join(lines)
+
+
 def log_exception(
     logger: logging.Logger,
     exc: BaseException,
@@ -141,11 +203,12 @@ def log_exception(
     error_code = _extract_error_code(exc)
     extra = " ".join(f"{key}={value}" for key, value in details.items())
     logger.error(
-        "FAILURE | context=%s | type=%s | code=%s | message=%s%s",
+        "FAILURE | context=%s | type=%s | code=%s | message=%s%s\n%s",
         context,
         type(exc).__name__,
         error_code,
         str(exc) or repr(exc),
         f" | {extra}" if extra else "",
+        format_exception_detail(exc),
         exc_info=True,
     )
