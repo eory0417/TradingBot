@@ -1,9 +1,13 @@
 # TradingBot-Plus
 
-**TradingBot**의 확장 버전입니다. 안정 운영용 원본은  
-[github.com/eory0417/TradingBot](https://github.com/eory0417/TradingBot) 에서 별도 관리합니다.
+**TradingBot**과 **동일한 기능**을 제공하는 별도 제품·저장소입니다.  
+안정 운영용 원본: [github.com/eory0417/TradingBot](https://github.com/eory0417/TradingBot)
 
-이 저장소(`TradingBot-Plus`)에서 Tree News, 텔레그램 등 **추가 뉴스 소스·기능**을 개발합니다.
+| 구분 | TradingBot | TradingBot-Plus |
+|------|------------|-----------------|
+| 기능 | 기준 버전 | **현재 동일** (RSS·FinBERT·GUI·exe 빌드 등) |
+| 차이 | `TradingBot.exe` | GUI 제목·빌드명 `TradingBotPlus.exe` |
+| 향후 | 안정 유지 | 추가 뉴스 소스 등 **별도 요청 시** 개발 |
 
 ---
 
@@ -39,8 +43,8 @@ secure configuration, and the verified-library foundation modules
     Magazine, The Block, Blockworks, NewsBTC, AMBCrypto, CryptoPotato, CoinJournal,
     Crypto.news, Bitcoinist, CryptoSlate, U.Today, BeInCrypto, …). Override with
     comma-separated `NEWS_RSS_FEEDS`.
-  - **CryptoPanic API** (optional token) — when `CRYPTOPANIC_API_TOKEN` is set,
-    it is used instead of RSS.
+  - **CryptoPanic API** (optional token) — used when `NEWS_SOURCE_MODE=cryptopanic`
+    and `CRYPTOPANIC_API_TOKEN` is set.
   - URL/title de-duplication across feeds.
 - **`SentimentAnalyzer`** — loads the institutional finance-tuned model
   `ProsusAI/finbert` and scores English text from **-1.0 (very negative)** to
@@ -70,6 +74,49 @@ asyncio.run(NewsAnalyzer().start(on_news))   # polls every minute
 
 > The first run downloads the FinBERT model (~400 MB) to the Hugging Face
 > cache; subsequent runs load it locally.
+
+## Stage Plus: coinnesskr Telegram news source
+
+In addition to RSS/CryptoPanic, TradingBot-Plus can receive the Korean
+real-time crypto feed **[@coinnesskr](https://t.me/coinnesskr)** via Telethon.
+Incoming Korean headlines are translated to English (`deep_translator`) and then
+scored by the same FinBERT pipeline, so the existing entry logic is reused
+unchanged.
+
+### News source modes (`NEWS_SOURCE_MODE`)
+
+| Mode             | RSS | coinnesskr | CryptoPanic |
+| ---------------- | :-: | :--------: | :---------: |
+| `rss`            |  O  |            |             |
+| `coinnesskr`     |     |     O      |             |
+| `rss_coinnesskr` |  O  |     O      |             |
+| `cryptopanic`    |     |            | O (token)   |
+
+Default is `rss_coinnesskr`. You can also switch modes at runtime from the
+Streamlit sidebar **뉴스 소스** selector (stop the bot, change, then restart).
+
+### Telegram credentials: two separate things
+
+| Variable                          | Purpose                                            |
+| --------------------------------- | -------------------------------------------------- |
+| `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID` | **Sending** alerts via a bot (`notifier.py`)   |
+| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | **Receiving** @coinnesskr via a user session |
+
+Get `API_ID` / `API_HASH` at [my.telegram.org](https://my.telegram.org). They
+are unrelated to the alert bot token.
+
+### One-time login (creates the session file)
+
+Before using any coinnesskr mode, subscribe to @coinnesskr in your Telegram
+account, then run once:
+
+```bash
+python telegram_login.py
+```
+
+Enter your phone number, the login code, and 2FA password if enabled. This
+creates `models/<TELEGRAM_SESSION_NAME>.session`. The session file is a full
+account credential — it is git-ignored; never commit or share it.
 
 ## Stage 3: indicators + marketable-limit order engine
 
@@ -201,11 +248,22 @@ copy .env.example .env             # Windows
 | -------------------- | -------------------------------------------- |
 | `BINANCE_API_KEY`    | Binance API key (Futures-enabled).           |
 | `BINANCE_SECRET_KEY` | Binance API secret.                          |
-| `TELEGRAM_TOKEN`     | Telegram bot token from @BotFather.          |
+| `TELEGRAM_TOKEN`     | Telegram bot token from @BotFather (alerts).  |
 | `TELEGRAM_CHAT_ID`   | Target chat/channel ID for alerts.           |
 | `BINANCE_TESTNET`    | `true`/`false` — use Futures testnet.        |
 | `LOG_LEVEL`          | `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`. |
 | `LOG_DIR`            | Directory for log files (default `logs`).    |
+
+Optional (coinnesskr news source — required only for `coinnesskr` /
+`rss_coinnesskr` modes):
+
+| Variable                | Description                                            |
+| ----------------------- | ------------------------------------------------------ |
+| `NEWS_SOURCE_MODE`      | `rss` / `coinnesskr` / `rss_coinnesskr` / `cryptopanic`. |
+| `TELEGRAM_API_ID`       | Telethon API id from my.telegram.org (receiving).      |
+| `TELEGRAM_API_HASH`     | Telethon API hash from my.telegram.org (receiving).    |
+| `TELEGRAM_SESSION_NAME` | Session file name (default `tradingbot_plus`).         |
+| `COINNESS_CHANNEL`      | Channel username to receive (default `coinnesskr`).    |
 
 ## Verify the installation
 

@@ -80,7 +80,38 @@ async def main() -> None:
     finally:
         await notifier.close()
 
+    # ---- coinnesskr 수신(선택) ----
+    log.info("News source mode: %s", settings.news_source_mode)
+    if settings.use_coinnesskr:
+        await _check_coinnesskr()
+
     log.info("=== Stage-1 health check finished ===")
+
+
+async def _check_coinnesskr() -> None:
+    """coinnesskr 모드일 때 세션/채널 접근 가능 여부를 스모크 테스트한다."""
+    from telegram_news import CoinnessListener
+
+    if not settings.telegram_api_id or not settings.telegram_api_hash_value:
+        log.warning("coinnesskr: TELEGRAM_API_ID/HASH 미설정 — 수신 비활성")
+        return
+    if not settings.telegram_session_path.exists():
+        log.warning(
+            "coinnesskr: 세션 파일 없음 (%s) — `python telegram_login.py` 실행 필요",
+            settings.telegram_session_path,
+        )
+        return
+
+    listener = CoinnessListener()
+    ok = await listener.connect()
+    if not ok:
+        log.error("coinnesskr: 연결/인증 실패 — telegram_login.py 재실행 필요")
+        return
+    try:
+        recent = await listener.warmup_recent(3)
+        log.info("coinnesskr: 연결 OK | 최근 메시지 %d건 파싱", len(recent))
+    finally:
+        await listener.stop()
 
 
 if __name__ == "__main__":

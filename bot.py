@@ -80,11 +80,12 @@ def auto_leverage_decision(score: float, slope: float) -> tuple[Side | None, int
     return None, 0
 
 # 코인 심볼 <-> 뉴스 키워드 매핑(뉴스 제목에서 대상 코인 탐지).
+# 영어(RSS·번역본) + 한국어(coinnesskr 번역 실패 시 fallback) 키워드를 함께 둔다.
 SYMBOL_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "BTC/USDT": ("bitcoin", "btc"),
-    "ETH/USDT": ("ethereum", "ether", "eth"),
-    "SOL/USDT": ("solana", "sol"),
-    "XRP/USDT": ("ripple", "xrp"),
+    "BTC/USDT": ("bitcoin", "btc", "비트코인"),
+    "ETH/USDT": ("ethereum", "ether", "eth", "이더리움", "이더"),
+    "SOL/USDT": ("solana", "sol", "솔라나"),
+    "XRP/USDT": ("ripple", "xrp", "리플"),
 }
 
 # SIM 모드 기준 시작 가격.
@@ -100,9 +101,13 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def detect_symbols(title: str, universe: list[str]) -> list[str]:
-    """뉴스 제목에서 언급된 대상 코인 심볼을 추출한다."""
-    text = title.lower()
+def detect_symbols(title: str, universe: list[str], title_ko: str = "") -> list[str]:
+    """뉴스 제목에서 언급된 대상 코인 심볼을 추출한다.
+
+    영어 제목과(있으면) 한국어 원문을 함께 검사해, 번역이 부정확하더라도
+    한국어 코인명으로 매칭할 수 있게 한다.
+    """
+    text = f"{title} {title_ko}".lower()
     hits = []
     for symbol in universe:
         for kw in SYMBOL_KEYWORDS.get(symbol, ()):  # 키워드 매칭
@@ -390,7 +395,11 @@ class TradingBot:
         pub = item.item.published_at
         if pub.tzinfo is None:
             pub = pub.replace(tzinfo=timezone.utc)
-        title_ko = await asyncio.to_thread(translate_to_korean, item.title)
+        # coinnesskr 는 원문이 이미 한국어이므로 재번역하지 않고 그대로 표시한다.
+        if item.item.origin == "coinnesskr" and item.item.title_ko:
+            title_ko = item.item.title_ko
+        else:
+            title_ko = await asyncio.to_thread(translate_to_korean, item.title)
         self.state.add_news(
             NewsView(
                 time=format_kst(pub, "%H:%M:%S"),
@@ -409,7 +418,7 @@ class TradingBot:
         except Exception as exc:  # noqa: BLE001
             log.debug("record_sample skipped | %s: %s", type(exc).__name__, exc)
 
-        symbols = detect_symbols(item.title, self.symbols)
+        symbols = detect_symbols(item.title, self.symbols, item.item.title_ko)
         for sym in symbols:
             self._latest_news[sym] = (item.title, item.score)
 

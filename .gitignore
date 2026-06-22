@@ -10,6 +10,10 @@ logs/
 # ---- Fine-tuned models & training samples (large / local) ----
 models/
 
+# ---- Telethon session files (account credential — never commit) ----
+*.session
+*.session-journal
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

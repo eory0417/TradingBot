@@ -9,3 +9,9 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+[server]
+# 8501은 다른 프로그램이 사용 중이므로 8502로 변경.
+port = 8502
+# transformers 비전 서브모듈(torchvision 미설치) 스캔 시 watcher 오류 로그 스팸 방지.
+fileWatcherType = "none"

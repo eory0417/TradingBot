@@ -17,12 +17,13 @@ Write-Host "빌드 시작 (수 분~십수 분 소요, 용량 2~4GB)..."
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $dist = Join-Path $PSScriptRoot "dist\TradingBot-Plus"
+New-Item -ItemType Directory -Force -Path (Join-Path $dist "models") | Out-Null
 Copy-Item -Force (Join-Path $PSScriptRoot ".env.example") (Join-Path $dist ".env.example")
 
 @"
 @echo off
 cd /d "%~dp0"
-echo TradingBot-Plus 시작 중... 브라우저에서 http://localhost:8501
+echo TradingBot-Plus 시작 중... 브라우저에서 http://localhost:8502
 TradingBotPlus.exe
 pause
 "@ | Set-Content -Encoding ASCII (Join-Path $dist "run.bat")
@@ -45,6 +46,8 @@ pause
 
 Write-Host ""
 Write-Host "완료: $dist" -ForegroundColor Green
-Write-Host "  1) dist\TradingBot-Plus\.env.example 를 .env 로 복사 후 API 키 입력"
-Write-Host "  2) TradingBotPlus.exe 또는 run.bat 실행"
-Write-Host "  3) 다른 PC로 옮길 때 dist\TradingBot-Plus 폴더 전체를 ZIP"
+Write-Host '  1) dist\TradingBot-Plus\.env.example -> .env 복사 후 API 키 입력'
+Write-Host '  2) coinnesskr: telegram_login.py 로 세션 생성 후 models\*.session 복사'
+Write-Host '  3) 선택: models\hf_cache 복사 시 FinBERT 재다운로드 생략'
+Write-Host '  4) TradingBotPlus.exe 또는 run.bat 실행 - http://localhost:8502'
+Write-Host '  5) 다른 PC: dist\TradingBot-Plus 폴더 전체 ZIP'

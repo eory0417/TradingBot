@@ -51,9 +51,22 @@ class Settings(BaseSettings):
     binance_secret_key: SecretStr = Field(..., alias="BINANCE_SECRET_KEY")
     binance_testnet: bool = Field(default=True, alias="BINANCE_TESTNET")
 
-    # ---- 텔레그램 ----
+    # ---- 텔레그램 (알림 발송용 봇) ----
     telegram_token: SecretStr = Field(..., alias="TELEGRAM_TOKEN")
     telegram_chat_id: str = Field(..., alias="TELEGRAM_CHAT_ID")
+
+    # ---- 텔레그램 (coinnesskr 수신용 유저 세션, Telethon) ----
+    # 알림 발송 봇(telegram_token)과 완전히 별개다. https://my.telegram.org 에서 발급.
+    telegram_api_id: int = Field(default=0, alias="TELEGRAM_API_ID")
+    telegram_api_hash: SecretStr = Field(
+        default=SecretStr(""), alias="TELEGRAM_API_HASH"
+    )
+    # 세션 파일 이름(확장자 제외). 실제 파일은 models/<name>.session 으로 저장된다.
+    telegram_session_name: str = Field(
+        default="tradingbot_plus", alias="TELEGRAM_SESSION_NAME"
+    )
+    # 수신 대상 텔레그램 채널 username(@ 제외).
+    coinness_channel: str = Field(default="coinnesskr", alias="COINNESS_CHANNEL")
 
     # ---- 로깅 ----
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
@@ -63,6 +76,10 @@ class Settings(BaseSettings):
     # CryptoPanic API 토큰은 선택 사항(설정 시 CryptoPanic 단독 모드 우선).
     cryptopanic_api_token: SecretStr = Field(
         default=SecretStr(""), alias="CRYPTOPANIC_API_TOKEN"
+    )
+    # 뉴스 소스 모드: rss | coinnesskr | rss_coinnesskr | cryptopanic.
+    news_source_mode: str = Field(
+        default="rss_coinnesskr", alias="NEWS_SOURCE_MODE"
     )
     # 선택: 쉼표 구분 RSS URL 오버라이드(비어 있으면 기본 16+ 피드 목록).
     news_rss_feeds: str = Field(default="", alias="NEWS_RSS_FEEDS")
@@ -189,10 +206,46 @@ class Settings(BaseSettings):
             raise ValueError("MARGIN_MODE must be 'isolated' or 'cross'")
         return normalized
 
+    @field_validator("news_source_mode")
+    @classmethod
+    def _validate_news_source_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        valid = {"rss", "coinnesskr", "rss_coinnesskr", "cryptopanic"}
+        if normalized not in valid:
+            raise ValueError(
+                f"NEWS_SOURCE_MODE must be one of {sorted(valid)}, got {value!r}"
+            )
+        return normalized
+
     @property
     def cryptopanic_token(self) -> str:
         """CryptoPanic 토큰을 평문 문자열로 반환(미설정 시 '')."""
         return self.cryptopanic_api_token.get_secret_value().strip()
+
+    @property
+    def use_rss(self) -> bool:
+        """현재 모드에서 RSS 폴링을 사용하는지 여부."""
+        return self.news_source_mode in {"rss", "rss_coinnesskr"}
+
+    @property
+    def use_coinnesskr(self) -> bool:
+        """현재 모드에서 coinnesskr(Telethon) 수신을 사용하는지 여부."""
+        return self.news_source_mode in {"coinnesskr", "rss_coinnesskr"}
+
+    @property
+    def use_cryptopanic(self) -> bool:
+        """현재 모드에서 CryptoPanic API를 사용하는지 여부."""
+        return self.news_source_mode == "cryptopanic"
+
+    @property
+    def telegram_api_hash_value(self) -> str:
+        """Telethon API hash 평문 문자열(미설정 시 '')."""
+        return self.telegram_api_hash.get_secret_value().strip()
+
+    @property
+    def telegram_session_path(self) -> Path:
+        """Telethon 세션 파일의 절대 경로(models/<name>.session)."""
+        return BASE_DIR / "models" / f"{self.telegram_session_name}.session"
 
     @property
     def rss_feed_urls(self) -> tuple[str, ...]:

@@ -22,6 +22,8 @@ LOCAL_MODULES = [
     "logger.py",
     "kst_util.py",
     "translator.py",
+    "telegram_news.py",
+    "telegram_login.py",
     "healthcheck.py",
 ]
 
@@ -34,6 +36,7 @@ datas += [(name, ".") for name in LOCAL_MODULES]
 
 hiddenimports = list(collect_submodules("ccxt"))
 hiddenimports += list(collect_submodules("feedparser"))
+hiddenimports += list(collect_submodules("telethon"))
 hiddenimports += [
     name.removesuffix(".py").replace("/", ".")
     for name in LOCAL_MODULES
@@ -51,6 +54,7 @@ for pkg in (
     "pydantic_settings",
     "deep_translator",
     "certifi",
+    "telethon",
 ):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
     datas += pkg_datas

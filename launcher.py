@@ -38,9 +38,9 @@ os.chdir(ROOT)
 
 os.environ.setdefault("HF_HOME", str(ROOT / "models" / "hf_cache"))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(ROOT / "models" / "hf_cache"))
+# transformers/torchvision 미설치 시 Streamlit watcher 오류 스팸 방지(dev·exe 공통).
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
 if getattr(sys, "frozen", False):
-    # PyInstaller 번들에서 transformers/torchvision 경고 스팸 방지.
-    os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 (ROOT / "logs").mkdir(exist_ok=True)

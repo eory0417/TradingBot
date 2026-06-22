@@ -96,6 +96,14 @@ st.markdown(
 
 _NEWS_LOG_HEIGHT = 230
 _CHART_HEIGHT = 210
+
+# 뉴스 소스 모드 라벨(사이드바 selectbox 표시용).
+NEWS_MODE_LABELS = {
+    "rss": "RSS only",
+    "coinnesskr": "coinnesskr only",
+    "rss_coinnesskr": "RSS + coinnesskr",
+    "cryptopanic": "CryptoPanic",
+}
 _PLOTLY_DARK = dict(
     template="plotly_dark",
     paper_bgcolor="rgba(0,0,0,0)",
@@ -299,8 +307,27 @@ def render_sidebar() -> None:
     )
 
     st.sidebar.divider()
-    col1, col2 = st.sidebar.columns(2)
     running = runner.is_alive() or STATE.running
+
+    # ---- 뉴스 소스 선택(봇 정지 상태에서만 변경 가능, 변경 후 재시작 필요) ----
+    mode_keys = list(NEWS_MODE_LABELS.keys())
+    cur_mode = settings.news_source_mode
+    cur_idx = mode_keys.index(cur_mode) if cur_mode in mode_keys else 0
+    chosen = st.sidebar.selectbox(
+        "뉴스 소스",
+        options=mode_keys,
+        index=cur_idx,
+        format_func=lambda k: NEWS_MODE_LABELS[k],
+        disabled=running,
+        help="변경하려면 봇을 정지한 뒤 선택하고 다시 시작하세요.",
+    )
+    if not running and chosen != cur_mode:
+        settings.news_source_mode = chosen
+    if running:
+        st.sidebar.caption("뉴스 소스는 실행 중 변경할 수 없습니다 — 정지 후 변경하세요.")
+
+    st.sidebar.divider()
+    col1, col2 = st.sidebar.columns(2)
     if col1.button(
         "▶ 시작", width="stretch", type="primary", disabled=running,
     ):
@@ -876,12 +903,13 @@ def render_dashboard() -> None:
     n_col, l_col = st.columns(2)
 
     with n_col:
-        st.caption(f"실시간 뉴스 (EN + 한글) · 발행/수신 {TZ_LABEL}")
+        src_label = NEWS_MODE_LABELS.get(settings.news_source_mode, settings.news_source_mode)
+        st.caption(f"실시간 뉴스 (EN + 한글) · 소스 {src_label} · 발행/수신 {TZ_LABEL}")
         news = STATE.get_news(30)
         with st.container(height=_NEWS_LOG_HEIGHT):
             if not news:
                 st.caption(
-                    "뉴스 수집 중… (FinBERT 로딩 후 워밍업·신규 RSS 기사 표시)"
+                    "뉴스 수집 중… (FinBERT 로딩 후 워밍업·신규 기사 표시)"
                 )
             for nw in news:
                 icon = "🟢" if nw.score > 0.2 else "🔴" if nw.score < -0.2 else "⚪"
