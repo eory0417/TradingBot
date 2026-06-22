@@ -11,9 +11,8 @@
     최적화한다(스레드 튜닝 + INT8 동적 양자화 + ``inference_mode``).
   * :class:`NewsAnalyzer`    - 1분 주기 폴링 루프를 오케스트레이션하여 새 뉴스를
     수집·점수화하고, 결과 ``AnalyzedNews``를 콜백으로 전달한다.
-    **시작 직후 첫 폴링은 워밍업**으로 피드에 이미 있는 기사를 ``seen`` 에만
-    등록하고 콜백을 호출하지 않는다. :mod:`bot` 은 추가로 시작 후
-    ``NEWS_ENTRY_GRACE_SEC``(기본 60초) 동안도 진입을 막는다.
+    **시작 직후 첫 폴링은 워밍업**으로 피드 기사를 ``seen`` 에 등록하되, 최근
+    기사는 GUI에 표시한다(진입은 :mod:`bot` 의 grace·발행 시각 규칙으로 제한).
 
 사용 예
 -------
@@ -83,6 +82,14 @@ CRYPTOPANIC_URL = "https://cryptopanic.com/api/v1/posts/"
 # 정중한 수집을 위한 HTTP 타임아웃/헤더.
 _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
 _HTTP_HEADERS = {"User-Agent": "NewsTradingBot/1.0 (+https://example.local)"}
+
+
+def _make_http_session() -> aiohttp.ClientSession:
+    """RSS/aiohttp DNS — exe 환경에서 aiodns 실패 시 시스템 DNS 사용."""
+    from aiohttp.resolver import ThreadedResolver
+
+    connector = aiohttp.TCPConnector(resolver=ThreadedResolver())
+    return aiohttp.ClientSession(headers=_HTTP_HEADERS, connector=connector, trust_env=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -431,7 +438,7 @@ class NewsAnalyzer:
         self._running = True
         log.info("NewsAnalyzer loop started | interval=%ds", self._interval)
 
-        async with aiohttp.ClientSession(headers=_HTTP_HEADERS) as session:
+        async with _make_http_session() as session:
             while self._running:
                 started = asyncio.get_event_loop().time()
                 try:
@@ -450,33 +457,14 @@ class NewsAnalyzer:
         """수집+분석 사이클을 1회 실행한다(테스트/수동 실행에 유용)."""
         if not self.sentiment._loaded:
             await asyncio.to_thread(self.sentiment.load)
-        async with aiohttp.ClientSession(headers=_HTTP_HEADERS) as session:
+        async with _make_http_session() as session:
             return await self._poll_once(session, callback)
 
-    async def _poll_once(
-        self, session: aiohttp.ClientSession, callback: NewsCallback
+    async def _analyze_and_dispatch(
+        self,
+        items: list[NewsItem],
+        callback: NewsCallback,
     ) -> list[AnalyzedNews]:
-        # ---- 시작 워밍업: 피드에 이미 있던 기사는 seen 만 등록, 콜백·진입 없음 ----
-        if self._warmup_pending:
-            all_items = await self.collector.fetch_all(session)
-            if not all_items:
-                log.warning("News warmup: feed empty — next poll will retry seeding")
-                return []
-            self.collector.seed_seen(all_items)
-            self._warmup_pending = False
-            self._last_warmup_count = len(all_items)
-            log.info(
-                "News warmup complete | seeded %d headline(s), callbacks suppressed",
-                len(all_items),
-            )
-            if self._on_status is not None:
-                self._on_status(
-                    f"뉴스 워밍업 완료 ({len(all_items)}건 등록) — 이후 신규 기사만 표시"
-                )
-            return []
-
-        items = await self.collector.fetch_new(session)
-
         analyzed: list[AnalyzedNews] = []
         for item in items:
             score, label, probs = await asyncio.to_thread(
@@ -490,10 +478,63 @@ class NewsAnalyzer:
                 log_exception(log, exc, context="news_callback", title=item.title)
         return analyzed
 
+    async def _poll_once(
+        self, session: aiohttp.ClientSession, callback: NewsCallback
+    ) -> list[AnalyzedNews]:
+        # ---- 시작 워밍업: seen 등록 + 최근 기사는 GUI 표시(진입은 bot 에서 제한) ----
+        if self._warmup_pending:
+            all_items = await self.collector.fetch_all(session)
+            if not all_items:
+                log.warning("News warmup: feed empty — next poll will retry seeding")
+                return []
+            self.collector.seed_seen(all_items)
+            self._warmup_pending = False
+            self._last_warmup_count = len(all_items)
+            display_items = _items_for_warmup_display(all_items)
+            log.info(
+                "News warmup complete | seeded=%d display=%d",
+                len(all_items),
+                len(display_items),
+            )
+            if self._on_status is not None:
+                self._on_status(
+                    f"뉴스 워밍업 완료 ({len(all_items)}건 등록, "
+                    f"최근 {len(display_items)}건 화면 표시)"
+                )
+            if display_items:
+                return await self._analyze_and_dispatch(display_items, callback)
+            return []
+
+        items = await self.collector.fetch_new(session)
+        if items:
+            log.info("Processing %d new headline(s) for display", len(items))
+        return await self._analyze_and_dispatch(items, callback)
+
 
 # --------------------------------------------------------------------------- #
 #  헬퍼
 # --------------------------------------------------------------------------- #
+def _items_for_warmup_display(items: list[NewsItem]) -> list[NewsItem]:
+    """워밍업 직후 GUI에 보여줄 최근 기사 목록(진입 여부와 무관)."""
+    limit = settings.news_warmup_display_limit
+    max_age = settings.news_max_age_minutes
+    now = datetime.now(timezone.utc)
+    sorted_items = sorted(items, key=lambda it: it.published_at, reverse=True)
+
+    if max_age > 0:
+        recent: list[NewsItem] = []
+        for it in sorted_items:
+            pub = it.published_at
+            if pub.tzinfo is None:
+                pub = pub.replace(tzinfo=timezone.utc)
+            if (now - pub).total_seconds() <= max_age * 60:
+                recent.append(it)
+        if recent:
+            return recent[:limit]
+
+    return sorted_items[:limit]
+
+
 def _hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 

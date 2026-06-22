@@ -881,7 +881,7 @@ def render_dashboard() -> None:
         with st.container(height=_NEWS_LOG_HEIGHT):
             if not news:
                 st.caption(
-                    "뉴스 수집 대기 중… (FinBERT 로딩·워밍업 후 **신규** RSS 기사만 표시)"
+                    "뉴스 수집 중… (FinBERT 로딩 후 워밍업·신규 RSS 기사 표시)"
                 )
             for nw in news:
                 icon = "🟢" if nw.score > 0.2 else "🔴" if nw.score < -0.2 else "⚪"

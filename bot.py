@@ -215,9 +215,9 @@ class TradingBot:
             self._emit_log("INFO", "system", "초기화 완료 — 뉴스·차트 수집 시작 (FinBERT 로딩 중일 수 있음)")
             self._emit_log(
                 "INFO", "system",
-                f"뉴스 워밍업: 첫 RSS 수집은 등록만(진입 없음) · "
-                f"시작 후 {settings.news_entry_grace_seconds}초 경과 + "
-                f"발행 {settings.news_max_age_minutes:.0f}분 이내 기사만 진입",
+                f"뉴스 워밍업: 최근 기사는 화면 표시 · 진입은 시작 후 "
+                f"{settings.news_entry_grace_seconds}초 + 발행 "
+                f"{settings.news_max_age_minutes:.0f}분 이내만",
             )
             news_task = asyncio.create_task(
                 self.news.start(

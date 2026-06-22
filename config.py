@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     news_entry_grace_seconds: int = Field(default=60, alias="NEWS_ENTRY_GRACE_SEC")
     # 진입 허용 최대 기사 나이(분). 발행 시각이 이보다 오래되면 진입하지 않는다.
     news_max_age_minutes: float = Field(default=30.0, alias="NEWS_MAX_AGE_MINUTES")
+    # 워밍업 직후 GUI에 표시할 최근 RSS 기사 수(진입은 grace·발행시각으로 별도 제한).
+    news_warmup_display_limit: int = Field(default=30, alias="NEWS_WARMUP_DISPLAY_LIMIT")
     # 기관급 금융 감성 분석 모델의 Hugging Face 모델 ID.
     finbert_model: str = Field(default="ProsusAI/finbert", alias="FINBERT_MODEL")
     # 추론 시 torch가 사용할 CPU 스레드 수(0 = 자동/전체 코어).
@@ -162,6 +164,13 @@ class Settings(BaseSettings):
     def _validate_news_max_age(cls, value: float) -> float:
         if value < 0:
             raise ValueError("NEWS_MAX_AGE_MINUTES must be >= 0")
+        return value
+
+    @field_validator("news_warmup_display_limit")
+    @classmethod
+    def _validate_warmup_display(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("NEWS_WARMUP_DISPLAY_LIMIT must be >= 1")
         return value
 
     @field_validator("order_time_in_force")
