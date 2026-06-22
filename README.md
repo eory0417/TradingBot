@@ -1,3 +1,12 @@
+# TradingBot-Plus
+
+**TradingBot**의 확장 버전입니다. 안정 운영용 원본은  
+[github.com/eory0417/TradingBot](https://github.com/eory0417/TradingBot) 에서 별도 관리합니다.
+
+이 저장소(`TradingBot-Plus`)에서 Tree News, 텔레그램 등 **추가 뉴스 소스·기능**을 개발합니다.
+
+---
+
 # Binance USDⓈ-M Futures News Trading Bot
 
 A Python-based news-driven trading system for Binance USDⓈ-M perpetual

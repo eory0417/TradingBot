@@ -1,4 +1,4 @@
-# TradingBot PyInstaller one-folder 포터블 빌드
+# TradingBot-Plus PyInstaller one-folder 포터블 빌드
 # 사용: powershell -ExecutionPolicy Bypass -File .\build.ps1
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -16,14 +16,14 @@ Write-Host "빌드 시작 (수 분~십수 분 소요, 용량 2~4GB)..."
 & $python -m PyInstaller --clean -y TradingBot.spec
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$dist = Join-Path $PSScriptRoot "dist\TradingBot"
+$dist = Join-Path $PSScriptRoot "dist\TradingBot-Plus"
 Copy-Item -Force (Join-Path $PSScriptRoot ".env.example") (Join-Path $dist ".env.example")
 
 @"
 @echo off
 cd /d "%~dp0"
-echo TradingBot 시작 중... 브라우저에서 http://localhost:8501
-TradingBot.exe
+echo TradingBot-Plus 시작 중... 브라우저에서 http://localhost:8501
+TradingBotPlus.exe
 pause
 "@ | Set-Content -Encoding ASCII (Join-Path $dist "run.bat")
 
@@ -45,6 +45,6 @@ pause
 
 Write-Host ""
 Write-Host "완료: $dist" -ForegroundColor Green
-Write-Host "  1) dist\TradingBot\.env.example 를 .env 로 복사 후 API 키 입력"
-Write-Host "  2) TradingBot.exe 또는 run.bat 실행"
-Write-Host "  3) 다른 PC로 옮길 때 dist\TradingBot 폴더 전체를 ZIP"
+Write-Host "  1) dist\TradingBot-Plus\.env.example 를 .env 로 복사 후 API 키 입력"
+Write-Host "  2) TradingBotPlus.exe 또는 run.bat 실행"
+Write-Host "  3) 다른 PC로 옮길 때 dist\TradingBot-Plus 폴더 전체를 ZIP"

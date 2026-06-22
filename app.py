@@ -22,7 +22,7 @@ from config import settings
 from state import STATE as BOT_STATE
 
 st.set_page_config(
-    page_title="뉴스 트레이딩 봇",
+    page_title="뉴스 트레이딩 봇 Plus",
     layout="wide",
     page_icon="📊",
     initial_sidebar_state="expanded",
@@ -916,7 +916,7 @@ def render_dashboard() -> None:
                 )
 
 
-st.markdown("# 📊 바이낸스 USDⓈ-M 뉴스 트레이딩 봇")
+st.markdown("# 📊 바이낸스 USDⓈ-M 뉴스 트레이딩 봇 **Plus**")
 
 render_sidebar()
 
