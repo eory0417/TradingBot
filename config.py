@@ -66,7 +66,10 @@ class Settings(BaseSettings):
         default="tradingbot_plus", alias="TELEGRAM_SESSION_NAME"
     )
     # 수신 대상 텔레그램 채널 username(@ 제외).
-    coinness_channel: str = Field(default="coinnesskr", alias="COINNESS_CHANNEL")
+    # 한국어: coinnesskr · 영어: coinnessGL
+    coinness_channel: str = Field(default="coinnessGL", alias="COINNESS_CHANNEL")
+    # 채널 언어: ko(한국어 → 영어 번역 후 분석) | en(영어 원문 그대로 분석).
+    coinness_lang: str = Field(default="en", alias="COINNESS_LANG")
 
     # ---- 로깅 ----
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
@@ -217,10 +220,23 @@ class Settings(BaseSettings):
             )
         return normalized
 
+    @field_validator("coinness_lang")
+    @classmethod
+    def _validate_coinness_lang(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"ko", "en"}:
+            raise ValueError("COINNESS_LANG must be 'ko' or 'en'")
+        return normalized
+
     @property
     def cryptopanic_token(self) -> str:
         """CryptoPanic 토큰을 평문 문자열로 반환(미설정 시 '')."""
         return self.cryptopanic_api_token.get_secret_value().strip()
+
+    @property
+    def coinness_is_english(self) -> bool:
+        """coinness 채널이 영어 원문(번역 불필요)인지 여부."""
+        return self.coinness_lang == "en"
 
     @property
     def use_rss(self) -> bool:

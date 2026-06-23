@@ -24,7 +24,8 @@ LOCAL_MODULES = [
     "translator.py",
     "telegram_news.py",
     "telegram_login.py",
-    "healthcheck.py",
+    "finbert_paths.py",
+    "http_session.py",
 ]
 
 datas = [

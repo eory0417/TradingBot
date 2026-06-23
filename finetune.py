@@ -19,9 +19,9 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 
 from config import BASE_DIR, settings
+from finbert_paths import finetune_model_dir, resolve_finbert_source
 from logger import get_logger, log_exception
 
 log = get_logger(__name__)
@@ -35,6 +35,12 @@ _VALID_LABELS = {"positive", "negative", "neutral"}
 
 # 파일 동시 접근 보호(봇 스레드에서 기록/학습이 함께 일어날 수 있음).
 _io_lock = threading.Lock()
+_sample_count_cache: tuple[int, float] | None = None  # (count, file mtime)
+
+
+def _invalidate_sample_count() -> None:
+    global _sample_count_cache
+    _sample_count_cache = None
 
 
 def _now() -> datetime:
@@ -52,17 +58,28 @@ def record_sample(text: str, label: str) -> None:
             _DATA_DIR.mkdir(parents=True, exist_ok=True)
             with _DATA_PATH.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"text": text, "label": label}, ensure_ascii=False) + "\n")
+            global _sample_count_cache
+            if _sample_count_cache is not None:
+                _sample_count_cache = (_sample_count_cache[0] + 1, _DATA_PATH.stat().st_mtime)
+            else:
+                _invalidate_sample_count()
     except Exception as exc:  # noqa: BLE001
         log.debug("record_sample skipped | %s: %s", type(exc).__name__, exc)
 
 
 def sample_count() -> int:
     """현재까지 누적된 학습 샘플 수."""
+    global _sample_count_cache
     if not _DATA_PATH.exists():
         return 0
     try:
+        mtime = _DATA_PATH.stat().st_mtime
+        if _sample_count_cache is not None and _sample_count_cache[1] == mtime:
+            return _sample_count_cache[0]
         with _DATA_PATH.open("r", encoding="utf-8") as fh:
-            return sum(1 for _ in fh)
+            count = sum(1 for _ in fh)
+        _sample_count_cache = (count, mtime)
+        return count
     except Exception:  # noqa: BLE001
         return 0
 
@@ -125,14 +142,6 @@ def _read_samples(max_samples: int) -> list[dict]:
     return rows[-max_samples:]
 
 
-def _resolve_base_source() -> str:
-    """이어서 학습할 베이스 경로: 직전 파인튜닝 모델이 있으면 그것, 없으면 원본."""
-    out = settings.finetune_path
-    if (out / "config.json").exists():
-        return str(out)
-    return settings.finbert_model
-
-
 def run_finetune() -> bool:
     """누적 샘플로 FinBERT 를 미세 조정하고 ``finetune_dir`` 에 저장한다.
 
@@ -159,7 +168,7 @@ def run_finetune() -> bool:
         return False
 
     try:
-        source = _resolve_base_source()
+        source = resolve_finbert_source()
         log.info("Fine-tune start | base=%s | samples=%d", source, len(samples))
 
         tokenizer = AutoTokenizer.from_pretrained(source)
@@ -212,7 +221,7 @@ def run_finetune() -> bool:
                 total_loss += float(loss.item())
             log.info("Fine-tune epoch %d/%d | avg_loss=%.4f", epoch + 1, epochs, total_loss / max(1, len(loader)))
 
-        out_dir = settings.finetune_path
+        out_dir = finetune_model_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(out_dir)
         tokenizer.save_pretrained(out_dir)

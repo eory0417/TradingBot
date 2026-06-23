@@ -51,6 +51,8 @@ import aiohttp
 import feedparser
 
 from config import settings
+from finbert_paths import resolve_finbert_source
+from http_session import DEFAULT_HTTP_TIMEOUT, make_client_session
 from logger import get_logger, log_exception
 from translator import translate_to_english
 
@@ -80,17 +82,10 @@ DEFAULT_RSS_FEEDS: tuple[str, ...] = (
 
 CRYPTOPANIC_URL = "https://cryptopanic.com/api/v1/posts/"
 
-# 정중한 수집을 위한 HTTP 타임아웃/헤더.
-_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
-_HTTP_HEADERS = {"User-Agent": "NewsTradingBot/1.0 (+https://example.local)"}
-
 
 def _make_http_session() -> aiohttp.ClientSession:
-    """RSS/aiohttp DNS — exe 환경에서 aiodns 실패 시 시스템 DNS 사용."""
-    from aiohttp.resolver import ThreadedResolver
-
-    connector = aiohttp.TCPConnector(resolver=ThreadedResolver())
-    return aiohttp.ClientSession(headers=_HTTP_HEADERS, connector=connector, trust_env=True)
+    """RSS/CryptoPanic 폴링용 세션 (``http_session`` 공통 팩토리)."""
+    return make_client_session()
 
 
 # --------------------------------------------------------------------------- #
@@ -211,7 +206,7 @@ class NewsCollector:
         params = {"auth_token": self._token, "public": "true", "kind": "news"}
         try:
             async with session.get(
-                CRYPTOPANIC_URL, params=params, timeout=_HTTP_TIMEOUT
+                CRYPTOPANIC_URL, params=params, timeout=DEFAULT_HTTP_TIMEOUT
             ) as resp:
                 resp.raise_for_status()
                 payload = await resp.json()
@@ -256,7 +251,7 @@ class NewsCollector:
     async def _fetch_one_feed(
         self, session: aiohttp.ClientSession, url: str
     ) -> list[NewsItem]:
-        async with session.get(url, timeout=_HTTP_TIMEOUT) as resp:
+        async with session.get(url, timeout=DEFAULT_HTTP_TIMEOUT) as resp:
             resp.raise_for_status()
             raw = await resp.read()
         # feedparser는 블로킹/CPU 바운드이므로 이벤트 루프 밖에서 실행한다.
@@ -303,14 +298,8 @@ class SentimentAnalyzer:
         self._loaded = False
 
     def _resolve_source(self) -> str:
-        """추론에 사용할 모델 경로: 파인튜닝 모델이 있으면 우선, 없으면 원본."""
-        try:
-            finetuned = settings.finetune_path
-            if (finetuned / "config.json").exists():
-                return str(finetuned)
-        except Exception:  # noqa: BLE001
-            pass
-        return self._model_name
+        """추론에 사용할 모델 경로 (``finbert_paths`` 공통 규칙)."""
+        return resolve_finbert_source()
 
     def reload(self) -> None:
         """현재 모델을 내리고 (파인튜닝본 우선) 다시 로드한다."""
@@ -406,6 +395,45 @@ class SentimentAnalyzer:
         label = max(prob_map, key=prob_map.get)
         return score, label, {k: round(v, 4) for k, v in prob_map.items()}
 
+    def analyze_batch(
+        self, texts: list[str],
+    ) -> list[tuple[float, str, dict[str, float]]]:
+        """여러 문장을 한 번의 forward pass 로 분석한다."""
+        if not self._loaded:
+            self.load()
+        assert self._torch is not None and self._model is not None
+
+        cleaned = [(t or "").strip() for t in texts]
+        if not cleaned:
+            return []
+
+        torch = self._torch
+        inputs = self._tokenizer(
+            cleaned,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            padding=True,
+        )
+        with torch.inference_mode():
+            logits = self._model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1)
+
+        results: list[tuple[float, str, dict[str, float]]] = []
+        for i, text in enumerate(cleaned):
+            if not text:
+                results.append((0.0, "neutral", {}))
+                continue
+            prob_map = {
+                self._id2label[j]: float(probs[i][j]) for j in range(probs.shape[1])
+            }
+            pos = prob_map.get("positive", 0.0)
+            neg = prob_map.get("negative", 0.0)
+            score = round(pos - neg, 4)
+            label = max(prob_map, key=prob_map.get)
+            results.append((score, label, {k: round(v, 4) for k, v in prob_map.items()}))
+        return results
+
 
 # --------------------------------------------------------------------------- #
 #  오케스트레이션: 매분 폴링, 수집 + 분석
@@ -423,7 +451,6 @@ class NewsAnalyzer:
         self._running = False
         # 시작 직후 첫 폴링: 피드에 남은 기존 기사는 seen 만 등록, 진입/콜백 생략.
         self._warmup_pending = True
-        self._last_warmup_count = 0
         self._on_status: Callable[[str], None] | None = None
         # 소스 간 중복 진입 방지(예: RSS·coinnesskr 가 같은 coinness.com URL 전달).
         self._dispatched: "OrderedDict[str, None]" = OrderedDict()
@@ -470,25 +497,25 @@ class NewsAnalyzer:
         """RSS/CryptoPanic 주기 폴링 루프."""
         async with _make_http_session() as session:
             while self._running:
-                started = asyncio.get_event_loop().time()
+                started = asyncio.get_running_loop().time()
                 try:
                     await self._poll_once(session, callback)
                 except Exception as exc:  # noqa: BLE001 - 루프는 살아남아야 한다
                     log_exception(log, exc, context="news_loop")
 
                 # 작업 소요 시간을 차감하고 남은 주기만큼 대기한다.
-                elapsed = asyncio.get_event_loop().time() - started
+                elapsed = asyncio.get_running_loop().time() - started
                 await asyncio.sleep(max(1.0, self._interval - elapsed))
 
     async def _coinness_loop(self, callback: NewsCallback) -> None:
-        """coinnesskr(Telethon) 실시간 수신 루프."""
+        """coinness(Telethon) 실시간 수신 루프."""
         from telegram_news import CoinnessListener
 
         listener = CoinnessListener()
         ok = await listener.connect()
         if not ok:
             if self._on_status is not None:
-                self._on_status("coinnesskr 비활성 — 세션/자격증명을 확인하세요 (telegram_login.py)")
+                self._on_status("coinness 비활성 — 세션/자격증명을 확인하세요 (telegram_login.py)")
             return
 
         # 워밍업: 최근 메시지를 seen 등록하고 일부는 GUI 표시(진입은 bot 에서 제한).
@@ -497,13 +524,13 @@ class NewsAnalyzer:
             for it in warm:
                 self._mark_dispatched(it)
             display = _items_for_warmup_display(warm)
-            log.info("coinnesskr warmup | recent=%d display=%d", len(warm), len(display))
+            log.info("coinness warmup | recent=%d display=%d", len(warm), len(display))
             if display:
                 await self._analyze_and_dispatch(display, callback, dedup=False)
 
         listener.add_handler(lambda item: self._analyze_and_dispatch([item], callback))
         if self._on_status is not None:
-            self._on_status(f"coinnesskr 수신 시작 (@{settings.coinness_channel})")
+            self._on_status(f"coinness 수신 시작 (@{settings.coinness_channel})")
 
         try:
             while self._running:
@@ -516,7 +543,7 @@ class NewsAnalyzer:
 
     def _mark_dispatched(self, item: NewsItem) -> bool:
         """이미 처리한 항목이면 ``True``. 아니면 등록 후 ``False`` 를 반환한다."""
-        key = _stable_item_id(item.url, item.title_ko or item.title, item.id)
+        key = _item_dedup_key(item)
         if key in self._dispatched:
             return True
         self._dispatched[key] = None
@@ -538,20 +565,31 @@ class NewsAnalyzer:
         *,
         dedup: bool = True,
     ) -> list[AnalyzedNews]:
-        analyzed: list[AnalyzedNews] = []
+        pending: list[NewsItem] = []
         for item in items:
             if dedup and self._mark_dispatched(item):
                 continue
-            # coinnesskr 는 한국어 → 영어로 번역해 FinBERT/심볼 탐지 입력을 통일한다.
             if item.origin == "coinnesskr":
-                en = await asyncio.to_thread(
-                    translate_to_english, item.title_ko or item.title
-                )
+                en = translate_to_english(item.title_ko or item.title)
                 if en:
                     item.title = en
-            score, label, probs = await asyncio.to_thread(
-                self.sentiment.analyze, item.title
+            pending.append(item)
+
+        if not pending:
+            return []
+
+        titles = [item.title for item in pending]
+        if len(titles) == 1:
+            batch_scores = [
+                await asyncio.to_thread(self.sentiment.analyze, titles[0])
+            ]
+        else:
+            batch_scores = await asyncio.to_thread(
+                self.sentiment.analyze_batch, titles
             )
+
+        analyzed: list[AnalyzedNews] = []
+        for item, (score, label, probs) in zip(pending, batch_scores):
             result = AnalyzedNews(item=item, score=score, label=label, probabilities=probs)
             analyzed.append(result)
             try:
@@ -571,7 +609,6 @@ class NewsAnalyzer:
                 return []
             self.collector.seed_seen(all_items)
             self._warmup_pending = False
-            self._last_warmup_count = len(all_items)
             display_items = _items_for_warmup_display(all_items)
             log.info(
                 "News warmup complete | seeded=%d display=%d",
@@ -645,12 +682,16 @@ def _stable_item_id(url: str, title: str, fallback: str) -> str:
     return fallback
 
 
+def _item_dedup_key(item: NewsItem) -> str:
+    """뉴스 항목의 중복 제거·dispatch 키."""
+    return _stable_item_id(item.url, item.title_ko or item.title, item.id)
+
+
 def _dedupe_items(items: list[NewsItem]) -> list[NewsItem]:
     """URL·제목 기준 중복 제거. 동일 기사면 published_at 이 더 이른 항목 유지."""
     by_key: dict[str, NewsItem] = {}
     for item in items:
-        norm_url = _normalize_url(item.url)
-        key = norm_url or f"title:{_hash(_normalize_title(item.title))}"
+        key = _item_dedup_key(item)
         existing = by_key.get(key)
         if existing is None or item.published_at < existing.published_at:
             by_key[key] = item

@@ -9,6 +9,17 @@ from logger import get_logger
 log = get_logger(__name__)
 
 _MAX_CHARS = 500
+_translators: dict[tuple[str, str], object] = {}
+
+
+def _get_translator(source: str, target: str):
+    """GoogleTranslator 인스턴스를 (source, target) 별로 재사용한다."""
+    key = (source, target)
+    if key not in _translators:
+        from deep_translator import GoogleTranslator
+
+        _translators[key] = GoogleTranslator(source=source, target=target)
+    return _translators[key]
 
 
 @lru_cache(maxsize=512)
@@ -33,9 +44,7 @@ def _translate(text: str, *, source: str, target: str) -> str:
         return ""
     snippet = cleaned[:_MAX_CHARS]
     try:
-        from deep_translator import GoogleTranslator
-
-        result = GoogleTranslator(source=source, target=target).translate(snippet)
+        result = _get_translator(source, target).translate(snippet)
         return (result or snippet).strip()
     except Exception as exc:  # noqa: BLE001
         log.debug("Translation skipped | %s: %s", type(exc).__name__, exc)

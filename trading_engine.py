@@ -209,7 +209,7 @@ class TradingEngine:
             log.warning("Insufficient candles for indicators | symbol=%s", symbol)
             return None
         indicators = compute_indicators_from_df(symbol, self.timeframe, df)
-        log.info(
+        log.debug(
             "Indicators | %s | price=%.4f RSI=%.2f ATR=%.4f slope=%.6f(%.3f%%) dir=%s",
             indicators.symbol,
             indicators.last_price,

@@ -22,13 +22,9 @@ from exchange import close_exchange, create_exchange, load_markets_safe
 from logger import get_logger
 from notifier import TelegramNotifier
 
+from bot import has_real_credentials
+
 log = get_logger("healthcheck")
-
-
-def _has_real_credentials() -> bool:
-    """휴리스틱: 자격증명이 실제처럼 보이는지(번들된 플레이스홀더가 아닌지)."""
-    api_key = settings.binance_api_key.get_secret_value()
-    return bool(api_key) and "your_" not in api_key
 
 
 async def main() -> None:
@@ -43,7 +39,7 @@ async def main() -> None:
     # ---- 거래소 ----
     exchange = create_exchange()
     try:
-        if _has_real_credentials():
+        if has_real_credentials():
             ok, market_err = await load_markets_safe(exchange)
             log.info("Exchange load_markets: %s", "OK" if ok else "FAILED")
             if market_err:
@@ -69,7 +65,7 @@ async def main() -> None:
     # ---- 텔레그램 ----
     notifier = TelegramNotifier()
     try:
-        if _has_real_credentials():
+        if has_real_credentials():
             sent = await notifier.send("✅ Stage-1 health check: notifier online")
             log.info("Telegram send: %s", "OK" if sent else "FAILED")
         else:

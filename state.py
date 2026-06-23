@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -46,6 +46,7 @@ class PositionView:
     entry_news: str
     entry_score: float
     opened_at: str
+    entry_news_ko: str = ""
     leverage: int = 1
     opened_at_ms: int = 0   # 진입 시각(epoch ms) — 차트 진입 표시용
     news_triggered_at_ms: int = 0  # 뉴스 인식(진입 트리거) 시각(epoch ms)
@@ -76,8 +77,6 @@ class BotState:
         self._balance: float = 0.0
         self._positions: dict[str, PositionView] = {}
         self._ohlcv: dict[str, list[list[float]]] = {}
-        # TP/SL 라인 히스토리(차트 오버레이용): {symbol: [(ts, stop, trail), ...]}
-        self._lines: dict[str, deque] = {}
         self._news: deque[NewsView] = deque(maxlen=200)
         self._logs: deque[dict] = deque(maxlen=500)
         # 수동 청산 요청 큐(GUI → 봇 모니터 루프). 심볼 집합.
@@ -162,15 +161,6 @@ class BotState:
         with self._lock:
             return list(self._ohlcv.get(symbol, []))
 
-    def push_lines(self, symbol: str, stop: float, trail: float) -> None:
-        with self._lock:
-            dq = self._lines.setdefault(symbol, deque(maxlen=500))
-            dq.append((_now().isoformat(), stop, trail))
-
-    def get_lines(self, symbol: str) -> list[tuple]:
-        with self._lock:
-            return list(self._lines.get(symbol, []))
-
     def symbols_with_data(self) -> list[str]:
         with self._lock:
             return list(self._ohlcv.keys())
@@ -219,10 +209,6 @@ class BotState:
             self._settings.update(kwargs)
             self._touch()
 
-    def get_settings(self) -> dict[str, Any]:
-        with self._lock:
-            return dict(self._settings)
-
     # ---- 실행 상태 ----
     def set_running(self, running: bool, status: str | None = None) -> None:
         with self._lock:
@@ -245,19 +231,6 @@ class BotState:
     def last_update(self) -> str:
         with self._lock:
             return self._last_update
-
-    def snapshot(self) -> dict:
-        """전체 상태의 직렬화 가능한 스냅샷(디버깅/표시용)."""
-        with self._lock:
-            return {
-                "balance": self._balance,
-                "positions": [asdict(p) for p in self._positions.values()],
-                "news": [asdict(n) for n in list(self._news)[:20]],
-                "logs": list(self._logs)[:50],
-                "settings": dict(self._settings),
-                "status": self._status,
-                "running": self._running,
-            }
 
     def _touch(self) -> None:
         self._last_update = _now().isoformat()

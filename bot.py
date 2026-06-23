@@ -21,7 +21,6 @@ Streamlit GUI가 실시간으로 표시할 수 있게 한다.
 from __future__ import annotations
 
 import asyncio
-import random
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
@@ -35,7 +34,7 @@ from news_analyzer import AnalyzedNews, NewsAnalyzer
 from state import STATE, NewsView, PositionView
 from strategy import ExitSignal, Position, Side
 from kst_util import format_kst
-from trading_engine import TradingEngine, compute_indicators_from_df
+from trading_engine import TradingEngine, compute_indicators_from_df, RSI_LENGTH, ATR_LENGTH
 from translator import translate_to_korean
 
 log = get_logger(__name__)
@@ -195,6 +194,9 @@ class TradingBot:
         self._lock = asyncio.Lock()
         self._running = False
         self._started_at: datetime | None = None
+        self._ohlcv_cache: dict[str, list[list[float]]] = {}
+        self._last_balance_fetch: float = 0.0
+        self._balance_poll_sec = 60.0
 
         # 모드별 구성.
         self.exchange = None
@@ -358,14 +360,36 @@ class TradingBot:
         """GUI 등 외부에서 즉시 재학습을 요청한다(다음 루프 틱에 실행)."""
         self._finetune_now = True
 
-    async def _news_context(self, news: str, score: float | None = None) -> str:
-        """로그용 뉴스 요약(영문 원문 + 한글 번역)."""
-        ko = await asyncio.to_thread(translate_to_korean, news)
-        en = news if len(news) <= 120 else news[:117] + "…"
-        ko_show = ko if len(ko) <= 120 else ko[:117] + "…"
+    def _resolve_news_titles(self, item: AnalyzedNews) -> tuple[str, str]:
+        """표시·로그·알림용 (영문, 한글) 제목 쌍을 반환한다."""
+        en = item.title
+        if item.item.origin == "coinnesskr" and item.item.title_ko:
+            ko = item.item.title_ko
+        else:
+            ko = translate_to_korean(en)
+        return en, ko
+
+    @staticmethod
+    def _format_bilingual(
+        en: str, ko: str, score: float | None = None, *, max_len: int = 120,
+    ) -> str:
+        """로그·알림용 영문+한글 한 줄 요약."""
+        en_show = en if len(en) <= max_len else en[: max_len - 1] + "…"
+        ko_show = (ko or "").strip()
+        if not ko_show:
+            ko_show = "번역 없음"
+        elif len(ko_show) > max_len:
+            ko_show = ko_show[: max_len - 1] + "…"
         if score is not None:
-            return f"뉴스({score:+.2f}) | EN: {en} | 한글: {ko_show}"
-        return f"EN: {en} | 한글: {ko_show}"
+            return f"뉴스({score:+.2f}) | EN: {en_show} | 한글: {ko_show}"
+        return f"EN: {en_show} | 한글: {ko_show}"
+
+    def _news_context(
+        self, news: str, score: float | None = None, news_ko: str | None = None,
+    ) -> str:
+        """로그용 뉴스 요약(영문 원문 + 한글 번역)."""
+        ko = news_ko if news_ko is not None else translate_to_korean(news)
+        return self._format_bilingual(news, ko, score)
 
     def _news_entry_allowed(self) -> bool:
         """시작 후 grace 기간이 지났는지(진입 허용 여부)."""
@@ -395,15 +419,11 @@ class TradingBot:
         pub = item.item.published_at
         if pub.tzinfo is None:
             pub = pub.replace(tzinfo=timezone.utc)
-        # coinnesskr 는 원문이 이미 한국어이므로 재번역하지 않고 그대로 표시한다.
-        if item.item.origin == "coinnesskr" and item.item.title_ko:
-            title_ko = item.item.title_ko
-        else:
-            title_ko = await asyncio.to_thread(translate_to_korean, item.title)
+        title_en, title_ko = self._resolve_news_titles(item)
         self.state.add_news(
             NewsView(
                 time=format_kst(pub, "%H:%M:%S"),
-                title=item.title,
+                title=title_en,
                 score=item.score,
                 label=item.label,
                 source=item.item.source,
@@ -422,26 +442,41 @@ class TradingBot:
         for sym in symbols:
             self._latest_news[sym] = (item.title, item.score)
 
-        # 강한 감성 뉴스만 진입 평가(임계값은 실시간 설정을 사용).
+        # 강한 감성 뉴스만 진입 평가·우측 로그(임계값 미만·neutral 등은 로그 생략).
         if abs(item.score) < settings.news_score_threshold:
             return
+        if not symbols:
+            return
+        self._emit_log(
+            "INFO", "entry",
+            f"진입 평가 · [{item.label}] {self._format_bilingual(title_en, title_ko, item.score)}",
+        )
         if not self._news_entry_allowed():
             return
         if not self._is_fresh_entry_news(item):
             pub_kst = format_kst(pub, "%H:%M:%S")
             self._emit_log(
                 "INFO", "entry",
-                f"진입 스킵(구기사): 발행 {pub_kst} · {item.title[:80]}",
+                f"진입 스킵(구기사): 발행 {pub_kst} · "
+                f"{self._format_bilingual(title_en, title_ko, item.score)}",
             )
             return
         for sym in symbols:
             if sym in self.positions:
-                await self._maybe_add(sym, item.title, item.score)
+                await self._maybe_add(sym, title_en, item.score, title_ko)
             else:
-                await self._maybe_enter(sym, item.title, item.score, triggered_at)
+                await self._maybe_enter(
+                    sym, title_en, item.score, triggered_at, news_ko=title_ko,
+                )
 
     async def _maybe_enter(
-        self, symbol: str, news: str, score: float, news_triggered_at: datetime | None = None,
+        self,
+        symbol: str,
+        news: str,
+        score: float,
+        news_triggered_at: datetime | None = None,
+        *,
+        news_ko: str = "",
     ) -> None:
         async with self._lock:
             if symbol in self.positions:
@@ -463,7 +498,7 @@ class TradingBot:
             # |점수|=1.0 이면 역방향이라도 2배로 진입(추세 필터 무시).
             side, leverage = auto_leverage_decision(score, ind.slope)
             if side is None:
-                ctx = await self._news_context(news, score)
+                ctx = self._news_context(news, score, news_ko)
                 self._emit_log(
                     "INFO", "entry",
                     f"진입 스킵 {symbol}: {ctx} · 자동레버리지 기준 미충족 "
@@ -478,7 +513,7 @@ class TradingBot:
             elif score < 0 and ind.slope < 0:
                 side = "short"
             if side is None:
-                ctx = await self._news_context(news, score)
+                ctx = self._news_context(news, score, news_ko)
                 self._emit_log(
                     "INFO", "entry",
                     f"진입 스킵 {symbol}: {ctx} · 기울기({ind.slope:+.4f}) 방향 불일치",
@@ -486,7 +521,9 @@ class TradingBot:
                 return
             leverage = settings.leverage
 
-        await self._open(symbol, side, ind, news, score, leverage, news_triggered_at)
+        await self._open(
+            symbol, side, ind, news, score, leverage, news_triggered_at, news_ko=news_ko,
+        )
 
     # ---- 진입 ----
     async def _open(
@@ -498,6 +535,8 @@ class TradingBot:
         score: float,
         leverage: int,
         news_triggered_at: datetime | None = None,
+        *,
+        news_ko: str = "",
     ) -> None:
         # 실시간 설정 반영: 진입 시점의 명목금액을 사용(진입 후 스냅샷 고정).
         notional = settings.position_size_usdt
@@ -516,7 +555,7 @@ class TradingBot:
                 symbol, side, leverage=leverage, notional=notional
             )
             if not result.is_filled:
-                ctx = await self._news_context(news, score)
+                ctx = self._news_context(news, score, news_ko)
                 self._emit_log(
                     "ERROR", "order",
                     f"진입 실패 {symbol} {side}: {result.reason} | {ctx}",
@@ -529,7 +568,7 @@ class TradingBot:
             pos = Position(
                 symbol=symbol, side=side, amount=filled, entry_price=order_price,
                 atr=ind.atr if ind.atr and not np.isnan(ind.atr) else order_price * 0.01,
-                entry_news=news, entry_score=score,
+                entry_news=news, entry_news_ko=news_ko, entry_score=score,
                 news_triggered_at=triggered,
                 notional=notional, leverage=leverage,
                 margin=notional / leverage,
@@ -537,7 +576,7 @@ class TradingBot:
             pos.prev_rsi = ind.rsi
             self.positions[symbol] = pos
 
-        ctx = await self._news_context(news, score)
+        ctx = self._news_context(news, score, news_ko)
         self._emit_log(
             "INFO", "entry",
             f"진입 {side.upper()} {symbol} | 진입가={order_price:.4f} 수량={filled:.6f} "
@@ -545,9 +584,13 @@ class TradingBot:
         )
         self._sync_position_view(self.positions[symbol])
 
+        if not self.sim and self.engine is not None:
+            bal, _ = await self.engine.fetch_balance_usdt()
+            self.state.set_balance(bal)
+            self._last_balance_fetch = asyncio.get_running_loop().time()
+
         # 텔레그램 알림(LIVE 모드, 실제 자격증명 시).
         if self.notifier is not None:
-            news_ko = await asyncio.to_thread(translate_to_korean, news)
             await self.notifier.send_position_open(
                 symbol=symbol, side=side, amount_usdt=notional,
                 entry_price=order_price, news=news, score=score,
@@ -555,7 +598,9 @@ class TradingBot:
             )
 
     # ---- 추가 진입(피라미딩) ----
-    async def _maybe_add(self, symbol: str, news: str, score: float) -> None:
+    async def _maybe_add(
+        self, symbol: str, news: str, score: float, news_ko: str = "",
+    ) -> None:
         """보유 중인 포지션에 같은 방향·더 강한 뉴스가 오면 1회 추가 진입한다.
 
         조건: ① 아직 추가 진입한 적 없음 ② 뉴스 방향이 보유 방향과 동일
@@ -580,7 +625,7 @@ class TradingBot:
             or (pos.side == "short" and ind.last_price < pos.entry_price)
         )
         if not favorable:
-            ctx = await self._news_context(news, score)
+            ctx = self._news_context(news, score, news_ko)
             self._emit_log(
                 "INFO", "entry",
                 f"추가진입 보류 {symbol}: 가격 미유리(현재 {ind.last_price:.4f} / "
@@ -593,9 +638,18 @@ class TradingBot:
             add_lev = score_to_leverage(score)
         else:
             add_lev = min(pos.leverage + 1, 25)
-        await self._add(pos, ind, news, score, max(1, int(add_lev)))
+        await self._add(pos, ind, news, score, max(1, int(add_lev)), news_ko=news_ko)
 
-    async def _add(self, pos: Position, ind, news: str, score: float, leverage: int) -> None:
+    async def _add(
+        self,
+        pos: Position,
+        ind,
+        news: str,
+        score: float,
+        leverage: int,
+        *,
+        news_ko: str = "",
+    ) -> None:
         notional = settings.position_size_usdt
         leverage = max(1, int(leverage))
         price = ind.last_price
@@ -610,7 +664,7 @@ class TradingBot:
                 pos.symbol, pos.side, leverage=leverage, notional=notional
             )
             if not result.is_filled:
-                ctx = await self._news_context(news, score)
+                ctx = self._news_context(news, score, news_ko)
                 self._emit_log(
                     "ERROR", "order",
                     f"추가진입 실패 {pos.symbol} {pos.side}: {result.reason} | {ctx}",
@@ -627,8 +681,10 @@ class TradingBot:
                 add_margin=add_margin, leverage=leverage, atr=atr,
             )
             pos.prev_rsi = ind.rsi
+            if news_ko:
+                pos.entry_news_ko = news_ko
 
-        ctx = await self._news_context(news, score)
+        ctx = self._news_context(news, score, news_ko)
         self._emit_log(
             "INFO", "entry",
             f"➕ 추가진입 {pos.side.upper()} {pos.symbol} | 추가가={add_price:.4f} "
@@ -638,11 +694,10 @@ class TradingBot:
         self._sync_position_view(pos)
 
         if self.notifier is not None:
-            news_ko = await asyncio.to_thread(translate_to_korean, news)
             await self.notifier.send_position_open(
                 symbol=pos.symbol, side=pos.side, amount_usdt=notional,
                 entry_price=add_price, news=news, score=score,
-                news_ko=news_ko, leverage=leverage,
+                news_ko=news_ko or pos.entry_news_ko, leverage=leverage,
             )
 
     # ---- 모니터 루프(가격 갱신 + 청산 판정) ----
@@ -674,10 +729,8 @@ class TradingBot:
             ind = await self._indicators(symbol)
             if ind is None:
                 continue
-            mark = ind.last_price
 
-            # 차트용 OHLCV/라인 상태 저장.
-            ohlcv = await self._ohlcv(symbol)
+            ohlcv = self._ohlcv_cache.get(symbol, [])
             if ohlcv:
                 self.state.set_ohlcv(symbol, ohlcv)
 
@@ -687,20 +740,23 @@ class TradingBot:
 
             news_title, news_score = self._latest_news[symbol]
             signal = pos.update(
-                mark, atr=ind.atr, slope=ind.slope, rsi=ind.rsi, news_score=news_score,
+                ind.last_price, atr=ind.atr, slope=ind.slope, rsi=ind.rsi,
+                news_score=news_score,
             )
-            self.state.push_lines(symbol, pos.stop_loss_price, pos.trailing_stop)
             self._sync_position_view(pos)
 
             if signal.should_exit:
                 await self._close(pos, signal)
 
-        # 잔고 갱신(LIVE).
+        # 잔고 갱신(LIVE) — 60초마다 1회(모니터 주기와 분리).
         if not self.sim and self.engine is not None:
-            bal, bal_err = await self.engine.fetch_balance_usdt()
-            self.state.set_balance(bal)
-            if bal_err:
-                self._emit_log("ERROR", "system", f"잔고 조회 실패: {bal_err}")
+            loop = asyncio.get_running_loop()
+            if loop.time() - self._last_balance_fetch >= self._balance_poll_sec:
+                self._last_balance_fetch = loop.time()
+                bal, bal_err = await self.engine.fetch_balance_usdt()
+                self.state.set_balance(bal)
+                if bal_err:
+                    self._emit_log("ERROR", "system", f"잔고 조회 실패: {bal_err}")
 
     # ---- 청산 ----
     async def _close(self, pos: Position, signal) -> None:
@@ -726,6 +782,11 @@ class TradingBot:
             self.positions.pop(pos.symbol, None)
         self.state.remove_position(pos.symbol)
 
+        if not self.sim and self.engine is not None:
+            bal, _ = await self.engine.fetch_balance_usdt()
+            self.state.set_balance(bal)
+            self._last_balance_fetch = asyncio.get_running_loop().time()
+
         # 수익률 통계용 거래 기록.
         self.state.record_trade({
             "symbol": pos.symbol,
@@ -743,7 +804,7 @@ class TradingBot:
             "added": pos.added,
         })
 
-        ctx = await self._news_context(pos.entry_news, pos.entry_score)
+        ctx = self._news_context(pos.entry_news, pos.entry_score, pos.entry_news_ko)
         self._emit_log(
             "INFO", "exit",
             f"청산 {pos.side.upper()} {pos.symbol} | 진입가={pos.entry_price:.4f} "
@@ -752,28 +813,30 @@ class TradingBot:
         )
 
         if self.notifier is not None:
-            news_ko = await asyncio.to_thread(translate_to_korean, pos.entry_news)
             await self.notifier.send_position_close(
                 symbol=pos.symbol, side=pos.side, amount_usdt=pos.notional,
                 entry_price=pos.entry_price, exit_price=exit_price, pnl_pct=pnl_pct,
                 reason=f"{signal.exit_type}: {signal.reason}",
                 news=pos.entry_news, score=pos.entry_score,
-                pnl_usdt=pnl_usdt, news_ko=news_ko,
+                pnl_usdt=pnl_usdt, news_ko=pos.entry_news_ko,
             )
 
     # ---- 헬퍼 ----
-    async def _ohlcv(self, symbol: str) -> list[list[float]]:
-        if self.sim:
-            return self.sim_market.ohlcv(symbol)
-        df = await self.engine.fetch_ohlcv_df(symbol)
-        return df.values.tolist() if df is not None else []
-
     async def _indicators(self, symbol: str):
         if self.sim:
             ohlcv = self.sim_market.ohlcv(symbol)
-            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            self._ohlcv_cache[symbol] = ohlcv
+            df = pd.DataFrame(
+                ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
             return compute_indicators_from_df(symbol, settings.timeframe, df)
-        return await self.engine.compute_indicators(symbol)
+        df = await self.engine.fetch_ohlcv_df(symbol)
+        if df is None:
+            return None
+        self._ohlcv_cache[symbol] = df.values.tolist()
+        if len(df) < max(RSI_LENGTH, ATR_LENGTH) + 1:
+            return None
+        return compute_indicators_from_df(symbol, settings.timeframe, df)
 
     def _sync_position_view(self, pos: Position) -> None:
         self.state.upsert_position(
@@ -782,7 +845,8 @@ class TradingBot:
                 entry_price=pos.entry_price, mark_price=pos.mark_price,
                 stop_loss=pos.stop_loss_price, trailing_stop=pos.trailing_stop,
                 atr_mult=pos.atr_mult, unrealized_pct=pos.unrealized_pct(),
-                entry_news=pos.entry_news, entry_score=pos.entry_score,
+                entry_news=pos.entry_news, entry_news_ko=pos.entry_news_ko,
+                entry_score=pos.entry_score,
                 opened_at=format_kst(pos.opened_at),
                 leverage=pos.leverage,
                 opened_at_ms=int(pos.opened_at.timestamp() * 1000),

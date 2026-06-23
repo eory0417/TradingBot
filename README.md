@@ -75,13 +75,18 @@ asyncio.run(NewsAnalyzer().start(on_news))   # polls every minute
 > The first run downloads the FinBERT model (~400 MB) to the Hugging Face
 > cache; subsequent runs load it locally.
 
-## Stage Plus: coinnesskr Telegram news source
+## Stage Plus: coinness Telegram news source
 
-In addition to RSS/CryptoPanic, TradingBot-Plus can receive the Korean
-real-time crypto feed **[@coinnesskr](https://t.me/coinnesskr)** via Telethon.
-Incoming Korean headlines are translated to English (`deep_translator`) and then
-scored by the same FinBERT pipeline, so the existing entry logic is reused
-unchanged.
+In addition to RSS/CryptoPanic, TradingBot-Plus can receive a real-time crypto
+feed from a coinness Telegram channel via Telethon. Two channels are supported,
+selected with `COINNESS_CHANNEL` + `COINNESS_LANG`:
+
+- **English (default): [@coinnessGL](https://t.me/coinnessGL)** — `COINNESS_LANG=en`.
+  Headlines are already English and are scored by FinBERT **without translation**.
+- **Korean: [@coinnesskr](https://t.me/coinnesskr)** — `COINNESS_LANG=ko`.
+  Korean headlines are translated to English (`deep_translator`) before scoring.
+
+Either way the same FinBERT pipeline and entry logic are reused unchanged.
 
 ### News source modes (`NEWS_SOURCE_MODE`)
 
@@ -263,7 +268,8 @@ Optional (coinnesskr news source — required only for `coinnesskr` /
 | `TELEGRAM_API_ID`       | Telethon API id from my.telegram.org (receiving).      |
 | `TELEGRAM_API_HASH`     | Telethon API hash from my.telegram.org (receiving).    |
 | `TELEGRAM_SESSION_NAME` | Session file name (default `tradingbot_plus`).         |
-| `COINNESS_CHANNEL`      | Channel username to receive (default `coinnesskr`).    |
+| `COINNESS_CHANNEL`      | Channel username to receive (default `coinnessGL`).    |
+| `COINNESS_LANG`         | `en` (analyze as-is) / `ko` (translate before analysis). |
 
 ## Verify the installation
 

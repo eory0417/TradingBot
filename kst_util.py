@@ -15,6 +15,7 @@ TZ_LABEL = "KST"
 __all__ = [
     "KST",
     "TZ_LABEL",
+    "ensure_utc",
     "format_gui_hms",
     "format_kst",
     "format_legacy_stored_hms",
@@ -30,11 +31,16 @@ def now_kst() -> datetime:
     return datetime.now(KST)
 
 
+def ensure_utc(dt: datetime) -> datetime:
+    """naive datetime 을 UTC 로 간주해 timezone-aware 로 만든다."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def to_kst(dt: datetime) -> datetime:
     """aware/naive datetime 을 KST 로 변환(naive 는 UTC 로 간주)."""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(KST)
+    return ensure_utc(dt).astimezone(KST)
 
 
 def format_kst(dt: datetime, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:

@@ -17,7 +17,7 @@ import streamlit as st
 import bot as botmod
 import chart_data
 import finetune
-from kst_util import KST, TZ_LABEL, format_gui_hms, format_kst, format_legacy_stored_hms, format_ms_kst, ms_to_kst_pandas, now_kst, series_ms_to_kst_pandas, to_kst
+from kst_util import KST, TZ_LABEL, format_gui_hms, format_kst, ms_to_kst_pandas, now_kst, series_ms_to_kst_pandas, to_kst
 from config import settings
 from state import STATE as BOT_STATE
 
@@ -73,6 +73,7 @@ st.markdown(
     .log-exit-win { background: rgba(88,166,255,0.14); border-left-color: #58a6ff; }
     .log-exit-loss { background: rgba(248,81,73,0.12); border-left-color: #f85149; }
     .log-fail { background: rgba(248,81,73,0.16); border-left-color: #f85149; }
+    .log-news { background: rgba(163,113,247,0.12); border-left-color: #a371f7; }
     .log-badge {
         display: inline-block; font-size: 0.68rem; font-weight: 700;
         padding: 0.02rem 0.35rem; border-radius: 3px; margin-right: 0.25rem;
@@ -81,6 +82,7 @@ st.markdown(
     .badge-entry { background: #3fb950; }
     .badge-exit { background: #58a6ff; }
     .badge-fail { background: #f85149; color: #fff; }
+    .badge-news { background: #a371f7; }
     .pos-row { font-size: 0.82rem; }
     .bot-status-hint {
         font-size: 0.68rem; color: #8b949e; margin-top: -0.35rem;
@@ -100,8 +102,8 @@ _CHART_HEIGHT = 210
 # 뉴스 소스 모드 라벨(사이드바 selectbox 표시용).
 NEWS_MODE_LABELS = {
     "rss": "RSS only",
-    "coinnesskr": "coinnesskr only",
-    "rss_coinnesskr": "RSS + coinnesskr",
+    "coinnesskr": "coinness only (텔레그램)",
+    "rss_coinnesskr": "RSS + coinness",
     "cryptopanic": "CryptoPanic",
 }
 _PLOTLY_DARK = dict(
@@ -367,22 +369,22 @@ def render_sidebar() -> None:
 
 
 def _collect_news_markers(symbol: str, pos) -> list[dict]:
-    """팝업 차트용 뉴스 인식 시점 마커 목록."""
-    markers: list[dict] = []
-    seen_ms: set[int] = set()
+    """실제 포지션 진입 시점의 뉴스 마커만 반환한다 (미진입 뉴스는 표시 안 함)."""
+    if pos is None:
+        return []
 
-    if pos is not None and getattr(pos, "news_triggered_at_ms", 0):
+    markers: list[dict] = []
+    if getattr(pos, "news_triggered_at_ms", 0):
         markers.append(
             {
                 "at_ms": int(pos.news_triggered_at_ms),
                 "label": "뉴스인식",
                 "score": float(pos.entry_score),
-                "title": (pos.entry_news or "진입 트리거 뉴스")[:80],
+                "title_en": (pos.entry_news or "진입 트리거 뉴스")[:120],
+                "title_ko": getattr(pos, "entry_news_ko", "")[:120],
             }
         )
-        seen_ms.add(int(pos.news_triggered_at_ms))
-    elif pos is not None and getattr(pos, "entry_news", ""):
-        # 구 포지션 등 news_triggered_at_ms 미기록 시 진입 뉴스를 진입 시각에 표시.
+    elif getattr(pos, "entry_news", ""):
         at_ms = int(getattr(pos, "opened_at_ms", 0) or 0)
         if at_ms:
             markers.append(
@@ -390,27 +392,37 @@ def _collect_news_markers(symbol: str, pos) -> list[dict]:
                     "at_ms": at_ms,
                     "label": "뉴스인식",
                     "score": float(pos.entry_score),
-                    "title": pos.entry_news[:80],
+                    "title_en": pos.entry_news[:120],
+                    "title_ko": getattr(pos, "entry_news_ko", "")[:120],
                 }
             )
-            seen_ms.add(at_ms)
+    return markers
 
-    for nw in STATE.get_news(50):
-        at_ms = int(getattr(nw, "at_ms", 0) or 0)
-        if not at_ms or at_ms in seen_ms:
-            continue
-        if symbol in botmod.detect_symbols(nw.title, [symbol]):
-            markers.append(
-                {
-                    "at_ms": at_ms,
-                    "label": "뉴스",
-                    "score": float(nw.score),
-                    "title": (nw.title_ko or nw.title)[:80],
-                }
+
+def _five_min_vertical_lines(times: pd.Series, y_min: float, y_max: float) -> list[dict]:
+    """1분봉 차트용 5분 간격 세로 눈금선."""
+    if times.empty:
+        return []
+    start = times.min().floor("5min")
+    end = times.max()
+    shapes: list[dict] = []
+    cursor = start
+    while cursor <= end:
+        shapes.append(
+            dict(
+                type="line",
+                xref="x",
+                yref="y",
+                x0=cursor,
+                x1=cursor,
+                y0=y_min,
+                y1=y_max,
+                line=dict(color="rgba(255,255,255,0.12)", width=1),
+                layer="below",
             )
-            seen_ms.add(at_ms)
-
-    return sorted(markers, key=lambda m: m["at_ms"])
+        )
+        cursor += pd.Timedelta(minutes=5)
+    return shapes
 
 
 def _same_moment_ms(a_ms: int, b_ms: int, window_ms: int = 60_000) -> bool:
@@ -544,10 +556,21 @@ def build_candlestick_figure(
             continue
         news_dt = ms_to_kst_pandas(at_ms)
         score = marker.get("score", 0.0)
-        title = marker.get("title", "")
+        title_en = marker.get("title_en") or marker.get("title", "")
+        title_ko = marker.get("title_ko", "")
         label = marker.get("label", "뉴스")
         overlap_entry = entry_ms and _same_moment_ms(at_ms, entry_ms)
         marker_y = news_y_high if overlap_entry else (y_hi * 0.85 + y_lo * 0.15)
+
+        hover_parts = [
+            f"{label} {news_dt.strftime('%H:%M:%S')} ({TZ_LABEL}) · score {score:+.2f}",
+        ]
+        if title_en:
+            hover_parts.append(f"EN: {title_en}")
+        if title_ko:
+            hover_parts.append(f"한글: {title_ko}")
+        if overlap_entry:
+            hover_parts.append("(진입과 동일 시각 — 상단 표시)")
 
         fig.add_trace(go.Scatter(
             x=[news_dt, news_dt], y=[y_min, y_max], mode="lines",
@@ -561,14 +584,23 @@ def build_candlestick_figure(
             text=[label], textposition="top center",
             textfont=dict(color="#a371f7", size=10),
             name=label, hoverinfo="text",
-            hovertext=[
-                f"{label} {news_dt.strftime('%H:%M:%S')} ({TZ_LABEL}) · score {score:+.2f}\n{title}"
-                + ("\n(진입과 동일 시각 — 상단 표시)" if overlap_entry else "")
-            ],
+            hovertext=["\n".join(hover_parts)],
             showlegend=show_legend,
         ))
 
     title_text = symbol if timeframe == "15m" else f"{symbol} · {timeframe}"
+    # 1분봉: 5분 간격 시간 라벨 + 세로 눈금선.
+    xaxis_cfg = dict(title=f"시간 ({TZ_LABEL})", showgrid=True)
+    layout_shapes: list[dict] = []
+    if timeframe == "1m":
+        xaxis_cfg.update(
+            dtick=5 * 60 * 1000,
+            tickformat="%H:%M",
+            tickangle=-45,
+            gridcolor="rgba(255,255,255,0.12)",
+            gridwidth=1,
+        )
+        layout_shapes = _five_min_vertical_lines(df["time"], y_min, y_max)
     fig.update_layout(
         height=height,
         margin=dict(l=4, r=72, t=28, b=4),
@@ -577,7 +609,8 @@ def build_candlestick_figure(
         showlegend=show_legend,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         yaxis=dict(range=[y_min, y_max], fixedrange=False),
-        xaxis=dict(title=f"시간 ({TZ_LABEL})"),
+        xaxis=xaxis_cfg,
+        shapes=layout_shapes,
         **_PLOTLY_DARK,
     )
     fig.update_xaxes(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.06)")
@@ -588,10 +621,17 @@ def build_candlestick_figure(
 def candlestick(symbol: str, height: int = _CHART_HEIGHT) -> go.Figure | None:
     ohlcv = STATE.get_ohlcv(symbol)
     pos = next((p for p in STATE.get_positions() if p.symbol == symbol), None)
-    news_markers = _collect_news_markers(symbol, pos) if pos else []
+    news_markers = _collect_news_markers(symbol, pos)
     return build_candlestick_figure(
         symbol, ohlcv, height=height, pos=pos, news_markers=news_markers,
     )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_chart_ohlcv(symbol: str, timeframe: str) -> tuple[tuple[float, ...], ...]:
+    """팝업 차트용 OHLCV (30초 캐시 — ccxt 호출 절감)."""
+    rows = chart_data.fetch_ohlcv(symbol, timeframe)
+    return tuple(tuple(row) for row in rows)
 
 
 @st.dialog("📈 차트 상세", width="large")
@@ -619,7 +659,7 @@ def chart_dialog() -> None:
     st.session_state[tf_key] = tf
 
     with st.spinner(f"{sym} · {tf} 차트 불러오는 중…"):
-        ohlcv = chart_data.fetch_ohlcv(sym, tf)
+        ohlcv = [list(row) for row in _fetch_chart_ohlcv(sym, tf)]
     news_markers = _collect_news_markers(sym, pos)
 
     trail_note = ""
@@ -812,6 +852,8 @@ def _log_style(lg: dict) -> tuple[str, str]:
     cat = lg.get("category", "")
     msg = lg.get("message", "")
     level = lg.get("level", "INFO")
+    if cat == "news":
+        return "log-news", '<span class="log-badge badge-news">뉴스</span>'
     if cat == "entry" and ("진입 " in msg or "추가진입" in msg) and "스킵" not in msg and "보류" not in msg:
         return "log-entry", '<span class="log-badge badge-entry">진입</span>'
     if cat == "exit":
@@ -913,7 +955,7 @@ def render_dashboard() -> None:
                 )
             for nw in news:
                 icon = "🟢" if nw.score > 0.2 else "🔴" if nw.score < -0.2 else "⚪"
-                ko = nw.title_ko or nw.title
+                ko = (nw.title_ko or "").strip() or "번역 없음"
                 st.markdown(
                     f'<div class="news-item">{icon} {_news_time_meta(nw)}<br>'
                     f"<b>[{nw.score:+.2f} {nw.label}]</b> "

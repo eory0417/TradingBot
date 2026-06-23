@@ -102,6 +102,7 @@ class Position:
     atr: float                       # 진입 시점(및 최신) ATR
     # 진입 시점 컨텍스트(텔레그램/GUI 표시용).
     entry_news: str = ""
+    entry_news_ko: str = ""
     entry_score: float = 0.0
     news_triggered_at: datetime = field(default_factory=_now)
     order_id: Optional[str] = None
@@ -232,85 +233,89 @@ class Position:
             self.atr = atr
 
         # ---- 1) 트레일링 활성화: 이익 구간 도달 시에만 ----
-        if not self.trailing_active:
-            if self._profit_pct(mark_price) >= self.trailing_profit_pct:
-                self._activate_trailing(mark_price)
+        try:
+            if not self.trailing_active:
+                if self._profit_pct(mark_price) >= self.trailing_profit_pct:
+                    self._activate_trailing(mark_price)
 
-        if rsi is not None:
-            self.prev_rsi = rsi
+            prev_rsi = self.prev_rsi
+            # ---- 2) 트레일링(이익 구간에서만): 축소·라인 이동·청산 ----
+            if self.trailing_active:
+                if not self.tightened and should_tighten(
+                    self.side,
+                    slope=slope,
+                    news_score=news_score,
+                    prev_rsi=prev_rsi,
+                    rsi=rsi,
+                    news_threshold=self.news_threshold,
+                ):
+                    self.tightened = True
+                    self.atr_mult = self.atr_mult_tight
 
-        # ---- 2) 트레일링(이익 구간에서만): 축소·라인 이동·청산 ----
-        if self.trailing_active:
-            if not self.tightened and should_tighten(
-                self.side,
-                slope=slope,
-                news_score=news_score,
-                prev_rsi=self.prev_rsi,
-                rsi=rsi,
-                news_threshold=self.news_threshold,
-            ):
-                self.tightened = True
-                self.atr_mult = self.atr_mult_tight
+                distance = self.atr * self.atr_mult
+                if self.side == "long":
+                    self.highest_price = max(self.highest_price, mark_price)
+                    candidate = self.highest_price - distance
+                    self.trailing_stop = max(
+                        self.trailing_stop, candidate, self.entry_price
+                    )
+                else:
+                    self.lowest_price = min(self.lowest_price, mark_price)
+                    candidate = self.lowest_price + distance
+                    self.trailing_stop = min(
+                        self.trailing_stop, candidate, self.entry_price
+                    )
 
-            distance = self.atr * self.atr_mult
-            if self.side == "long":
-                self.highest_price = max(self.highest_price, mark_price)
-                candidate = self.highest_price - distance
-                # 본전(진입가) 아래로는 내려가지 않음 → Trailing 으로 손실 청산 방지.
-                self.trailing_stop = max(self.trailing_stop, candidate, self.entry_price)
-            else:
-                self.lowest_price = min(self.lowest_price, mark_price)
-                candidate = self.lowest_price + distance
-                self.trailing_stop = min(self.trailing_stop, candidate, self.entry_price)
-
-        # ---- 3) 고정 손절(시장가) ----
-        if self.side == "long" and mark_price <= self.stop_loss_price:
-            return ExitSignal(
-                True,
-                reason=f"fixed stop-loss hit ({self.stop_loss_pct}%): "
-                f"{mark_price:.4f} <= {self.stop_loss_price:.4f}",
-                exit_type="stop_loss",
-                order_type="market",
-            )
-        if self.side == "short" and mark_price >= self.stop_loss_price:
-            return ExitSignal(
-                True,
-                reason=f"fixed stop-loss hit ({self.stop_loss_pct}%): "
-                f"{mark_price:.4f} >= {self.stop_loss_price:.4f}",
-                exit_type="stop_loss",
-                order_type="market",
-            )
-
-        # ---- 4) 동적 익절(트레일링 스톱 — 이익 구간 활성화 후에만) ----
-        if self.trailing_active:
-            if self.side == "long" and mark_price <= self.trailing_stop:
+            # ---- 3) 고정 손절(시장가) ----
+            if self.side == "long" and mark_price <= self.stop_loss_price:
                 return ExitSignal(
                     True,
-                    reason=f"trailing-stop hit (ATR x{self.atr_mult}): "
-                    f"{mark_price:.4f} <= {self.trailing_stop:.4f}",
-                    exit_type="trailing_stop",
+                    reason=f"fixed stop-loss hit ({self.stop_loss_pct}%): "
+                    f"{mark_price:.4f} <= {self.stop_loss_price:.4f}",
+                    exit_type="stop_loss",
                     order_type="market",
                 )
-            if self.side == "short" and mark_price >= self.trailing_stop:
+            if self.side == "short" and mark_price >= self.stop_loss_price:
                 return ExitSignal(
                     True,
-                    reason=f"trailing-stop hit (ATR x{self.atr_mult}): "
-                    f"{mark_price:.4f} >= {self.trailing_stop:.4f}",
-                    exit_type="trailing_stop",
+                    reason=f"fixed stop-loss hit ({self.stop_loss_pct}%): "
+                    f"{mark_price:.4f} >= {self.stop_loss_price:.4f}",
+                    exit_type="stop_loss",
                     order_type="market",
                 )
 
-        # ---- 5) 시간 청산(횡보 시, 시장 지정가) ----
-        # 가중치 축소(강한 추세)가 발동되지 않은 '추세 없는 횡보' 상태에서만 적용.
-        held = now - self.opened_at
-        if not self.tightened and held >= timedelta(hours=self.time_exit_hours):
-            hours = held.total_seconds() / 3600
-            return ExitSignal(
-                True,
-                reason=f"time exit: held {hours:.1f}h >= {self.time_exit_hours}h "
-                f"without a clear trend (sideways)",
-                exit_type="time_exit",
-                order_type="marketable_limit",
-            )
+            # ---- 4) 동적 익절(트레일링 스톱 — 이익 구간 활성화 후에만) ----
+            if self.trailing_active:
+                if self.side == "long" and mark_price <= self.trailing_stop:
+                    return ExitSignal(
+                        True,
+                        reason=f"trailing-stop hit (ATR x{self.atr_mult}): "
+                        f"{mark_price:.4f} <= {self.trailing_stop:.4f}",
+                        exit_type="trailing_stop",
+                        order_type="market",
+                    )
+                if self.side == "short" and mark_price >= self.trailing_stop:
+                    return ExitSignal(
+                        True,
+                        reason=f"trailing-stop hit (ATR x{self.atr_mult}): "
+                        f"{mark_price:.4f} >= {self.trailing_stop:.4f}",
+                        exit_type="trailing_stop",
+                        order_type="market",
+                    )
 
-        return ExitSignal(False)
+            # ---- 5) 시간 청산(횡보 시, 시장 지정가) ----
+            held = now - self.opened_at
+            if not self.tightened and held >= timedelta(hours=self.time_exit_hours):
+                hours = held.total_seconds() / 3600
+                return ExitSignal(
+                    True,
+                    reason=f"time exit: held {hours:.1f}h >= {self.time_exit_hours}h "
+                    f"without a clear trend (sideways)",
+                    exit_type="time_exit",
+                    order_type="marketable_limit",
+                )
+
+            return ExitSignal(False)
+        finally:
+            if rsi is not None:
+                self.prev_rsi = rsi

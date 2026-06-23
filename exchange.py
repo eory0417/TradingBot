@@ -31,6 +31,7 @@ import time
 import ccxt.async_support as ccxt  # 비동기(논블로킹) ccxt 클라이언트
 
 from config import settings
+from http_session import create_tcp_connector
 from logger import format_exception_brief, format_exception_detail, get_logger, log_exception
 
 log = get_logger(__name__)
@@ -39,9 +40,6 @@ log = get_logger(__name__)
 def _patch_open_threaded_resolver(exchange: ccxt.binance) -> None:
     """aiodns(AsyncResolver)는 PyInstaller exe에서 DNS 실패가 잦다 → 시스템 DNS 사용."""
     import ssl
-
-    import aiohttp
-    from aiohttp.resolver import ThreadedResolver
 
     def patched_open() -> None:
         if exchange.asyncio_loop is None:
@@ -70,11 +68,11 @@ def _patch_open_threaded_resolver(exchange: ccxt.binance) -> None:
                     )
 
         if exchange.own_session and exchange.session is None:
-            exchange.tcp_connector = aiohttp.TCPConnector(
-                ssl=exchange.ssl_context,
+            import aiohttp
+
+            exchange.tcp_connector = create_tcp_connector(
                 loop=exchange.asyncio_loop,
-                enable_cleanup_closed=True,
-                resolver=ThreadedResolver(),
+                ssl=exchange.ssl_context,
             )
             exchange.session = aiohttp.ClientSession(
                 loop=exchange.asyncio_loop,
